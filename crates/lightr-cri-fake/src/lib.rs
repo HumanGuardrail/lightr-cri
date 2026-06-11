@@ -235,18 +235,14 @@ fn pid_alive(pid: u32) -> bool {
 fn read_proc_stats(pid: u32) -> (u64, u64) {
     // cpu_core_nanos from /proc/<pid>/stat fields utime+stime (in CLK_TCK ticks)
     let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) as u64 };
-    let cpu_nanos = if clk_tck > 0 {
-        if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
-            // fields are space-separated; utime=14th field (0-indexed=13), stime=15th (0-indexed=14)
-            let fields: Vec<&str> = stat.split_whitespace().collect();
-            if fields.len() > 14 {
-                let utime: u64 = fields[13].parse().unwrap_or(0);
-                let stime: u64 = fields[14].parse().unwrap_or(0);
-                let ticks = utime + stime;
-                ticks * (1_000_000_000 / clk_tck)
-            } else {
-                0
-            }
+    let nanos_per_tick = 1_000_000_000u64.checked_div(clk_tck).unwrap_or(0);
+    let cpu_nanos = if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // fields are space-separated; utime=14th field (0-indexed=13), stime=15th (0-indexed=14)
+        let fields: Vec<&str> = stat.split_whitespace().collect();
+        if fields.len() > 14 {
+            let utime: u64 = fields[13].parse().unwrap_or(0);
+            let stime: u64 = fields[14].parse().unwrap_or(0);
+            (utime + stime) * nanos_per_tick
         } else {
             0
         }
