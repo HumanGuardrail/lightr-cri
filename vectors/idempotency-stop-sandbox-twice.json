@@ -1,0 +1,11 @@
+{
+  "name": "idempotency-stop-sandbox-twice",
+  "steps": [
+    { "op": "run_sandbox", "cfg": { "name": "s1", "uid": "u1", "namespace": "ns", "attempt": 0 } },
+    { "op": "stop_sandbox", "id": "$0" },
+    { "op": "sandbox_status", "id": "$0", "expect_state": "NotReady" },
+    { "op": "stop_sandbox", "id": "$0" },
+    { "op": "sandbox_status", "id": "$0", "expect_state": "NotReady" },
+    { "op": "remove_sandbox", "id": "$0" }
+  ]
+}

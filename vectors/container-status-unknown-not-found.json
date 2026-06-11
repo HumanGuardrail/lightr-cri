@@ -1,0 +1,6 @@
+{
+  "name": "container-status-unknown-not-found",
+  "steps": [
+    { "op": "assert_status", "id": "does-not-exist-container-id", "state": "Created", "expect_err": "NotFound" }
+  ]
+}

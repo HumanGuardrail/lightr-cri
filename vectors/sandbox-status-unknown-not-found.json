@@ -1,0 +1,6 @@
+{
+  "name": "sandbox-status-unknown-not-found",
+  "steps": [
+    { "op": "sandbox_status", "id": "does-not-exist-sandbox-id", "expect_err": "NotFound" }
+  ]
+}

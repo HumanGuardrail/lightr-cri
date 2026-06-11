@@ -1,0 +1,14 @@
+{
+  "name": "crash-recovery-reopen-after-stop-preserves-exited",
+  "steps": [
+    { "op": "run_sandbox", "cfg": { "name": "s1", "uid": "u1", "namespace": "ns", "attempt": 0 } },
+    { "op": "create_container", "sandbox": "$0", "cfg": { "name": "c1", "attempt": 0, "image_ref": "ref/sh", "command": ["/bin/sh", "-c", "exit 42"] } },
+    { "op": "start_container", "id": "$1" },
+    { "op": "wait_exited", "id": "$1", "timeout_seconds": 10 },
+    { "op": "assert_status", "id": "$1", "state": "Exited", "exit_code": 42 },
+    { "op": "reopen_backend" },
+    { "op": "assert_status", "id": "$1", "state": "Exited", "exit_code": 42 },
+    { "op": "sandbox_status", "id": "$0", "expect_state": "Ready" },
+    { "op": "remove_sandbox", "id": "$0" }
+  ]
+}

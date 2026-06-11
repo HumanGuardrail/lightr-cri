@@ -1,0 +1,13 @@
+{
+  "name": "crash-recovery-reopen-preserves-images-and-not-ready-sandbox",
+  "steps": [
+    { "op": "pull_image", "ref": "ref/persist-test:1" },
+    { "op": "run_sandbox", "cfg": { "name": "s1", "uid": "u1", "namespace": "ns", "attempt": 0 } },
+    { "op": "stop_sandbox", "id": "$1" },
+    { "op": "sandbox_status", "id": "$1", "expect_state": "NotReady" },
+    { "op": "reopen_backend" },
+    { "op": "image_status", "ref": "ref/persist-test:1", "expect_present": true },
+    { "op": "sandbox_status", "id": "$1", "expect_state": "NotReady" },
+    { "op": "remove_sandbox", "id": "$1" }
+  ]
+}

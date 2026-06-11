@@ -1,0 +1,6 @@
+{
+  "name": "create-container-in-unknown-sandbox",
+  "steps": [
+    { "op": "create_container", "sandbox": "no-such-sandbox-id", "cfg": { "name": "c1", "attempt": 0, "image_ref": "ref/x", "command": ["/bin/true"] }, "expect_err": "NotFound" }
+  ]
+}
