@@ -1,0 +1,12 @@
+{
+  "name": "container-lifecycle-basic",
+  "steps": [
+    { "op": "run_sandbox", "cfg": { "name": "s1", "uid": "u1", "namespace": "ns", "attempt": 0 } },
+    { "op": "create_container", "sandbox": "$0", "cfg": { "name": "c1", "attempt": 0, "image_ref": "ref/busy", "command": ["/bin/sh", "-c", "exit 0"] } },
+    { "op": "start_container", "id": "$1" },
+    { "op": "wait_exited", "id": "$1", "timeout_seconds": 10 },
+    { "op": "assert_status", "id": "$1", "state": "Exited", "exit_code": 0 },
+    { "op": "remove_container", "id": "$1" },
+    { "op": "remove_sandbox", "id": "$0" }
+  ]
+}

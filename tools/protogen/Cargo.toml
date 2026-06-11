@@ -1,0 +1,9 @@
+[package]
+name = "protogen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+tonic-build = { workspace = true }

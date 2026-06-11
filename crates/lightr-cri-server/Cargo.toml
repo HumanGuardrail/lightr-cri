@@ -1,0 +1,19 @@
+[package]
+name = "lightr-cri-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "lightr-cri"
+path = "src/main.rs"
+
+[dependencies]
+lightr-cri-proto = { path = "../lightr-cri-proto" }
+lightr-cri-backend = { path = "../lightr-cri-backend" }
+lightr-cri-shell = { path = "../lightr-cri-shell" }
+lightr-cri-fake = { path = "../lightr-cri-fake" }
+tonic = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }

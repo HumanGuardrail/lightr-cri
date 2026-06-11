@@ -1,0 +1,13 @@
+{
+  "name": "crash-recovery-sandbox-survives",
+  "steps": [
+    { "op": "run_sandbox", "cfg": { "name": "s1", "uid": "u1", "namespace": "ns", "attempt": 0 } },
+    { "op": "create_container", "sandbox": "$0", "cfg": { "name": "c1", "attempt": 0, "image_ref": "ref/sleeper", "command": ["/bin/sleep", "30"] } },
+    { "op": "start_container", "id": "$1" },
+    { "op": "reopen_backend" },
+    { "op": "assert_status", "id": "$1", "state": "Running" },
+    { "op": "sandbox_status", "id": "$0", "expect_state": "Ready" },
+    { "op": "stop_container", "id": "$1", "grace_seconds": 0 },
+    { "op": "remove_sandbox", "id": "$0" }
+  ]
+}

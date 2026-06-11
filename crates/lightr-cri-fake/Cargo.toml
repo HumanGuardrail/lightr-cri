@@ -1,0 +1,17 @@
+[package]
+name = "lightr-cri-fake"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# FIREWALL: no tonic/prost/tokio here (seam-contract-v1 §0).
+[dependencies]
+lightr-cri-backend = { path = "../lightr-cri-backend" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

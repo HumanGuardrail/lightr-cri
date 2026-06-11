@@ -1,0 +1,17 @@
+[package]
+name = "lightr-cri-vectors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# FIREWALL: no tonic/prost/tokio here — vectors run against the trait and are
+# the shared artifact with hugr-lightr at integration (seam-contract-v1 §4).
+[dependencies]
+lightr-cri-backend = { path = "../lightr-cri-backend" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+lightr-cri-fake = { path = "../lightr-cri-fake" }
+tempfile = { workspace = true }

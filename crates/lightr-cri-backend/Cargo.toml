@@ -1,0 +1,11 @@
+[package]
+name = "lightr-cri-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# FIREWALL: this crate must never depend on tonic/prost/tokio
+# (seam-contract-v1 §0; keeps the real backend implementable in hugr-lightr).
+[dependencies]
+serde = { workspace = true }
