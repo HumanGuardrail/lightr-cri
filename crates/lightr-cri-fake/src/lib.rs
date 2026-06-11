@@ -436,8 +436,15 @@ impl CriBackend for FakeBackend {
     fn create_container(&self, sandbox: &SandboxId, cfg: ContainerConfig) -> Result<ContainerId> {
         {
             let cache = self.cache.lock().unwrap();
-            if !cache.sandboxes.contains_key(sandbox) {
-                return Err(BackendError::NotFound(format!("sandbox {}", sandbox.0)));
+            match cache.sandboxes.get(sandbox) {
+                None => return Err(BackendError::NotFound(format!("sandbox {}", sandbox.0))),
+                Some(sb) if sb.state != SandboxState::Ready => {
+                    return Err(BackendError::FailedPrecondition(format!(
+                        "sandbox {} is not Ready",
+                        sandbox.0
+                    )))
+                }
+                Some(_) => {}
             }
         }
         let id = ContainerId(new_id("ct-"));

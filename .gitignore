@@ -4,3 +4,4 @@
 .techlead/
 *.sock
 /tmp/
+.claude/

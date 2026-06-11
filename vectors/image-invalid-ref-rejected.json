@@ -1,6 +1,6 @@
 {
   "name": "image-invalid-ref-rejected",
   "steps": [
-    { "op": "pull_image", "ref": ":::invalid:::ref:::", "expect_err": "InvalidArgument" }
+    { "op": "pull_image", "ref": "invalid ref with whitespace", "expect_err": "InvalidArgument" }
   ]
 }

@@ -23,11 +23,14 @@ pub struct VectorReport {
     pub failed: Vec<String>,
 }
 
-/// Factory so crash-recovery vectors can drop + reopen the backend
-/// (`reopen_backend` step). The fake reopens from its state root; the real
-/// backend will do the same at integration.
+/// Factory so each vector runs ISOLATED and crash-recovery vectors can drop
+/// + reopen the same state (`reopen_backend` step). The fake rotates state
+/// roots per `fresh()`; the real backend will do the same at integration.
 pub trait BackendFactory {
-    fn open(&self) -> Box<dyn CriBackend>;
+    /// Fresh, isolated state for a new vector (no leakage between vectors).
+    fn fresh(&self) -> Box<dyn CriBackend>;
+    /// Reopen the state of the most recent `fresh()` (crash-recovery law).
+    fn reopen(&self) -> Box<dyn CriBackend>;
 }
 
 // ── Vector JSON shape ────────────────────────────────────────────────────────
@@ -176,7 +179,7 @@ fn run_vector(
     factory: &dyn BackendFactory,
     vector: &Vector,
 ) -> Result<(), String> {
-    let mut backend: Box<dyn CriBackend> = factory.open();
+    let mut backend: Box<dyn CriBackend> = factory.fresh();
     // results[i] = the String result of step i (None if step produced no id)
     let mut results: Vec<Option<String>> = Vec::new();
 
@@ -585,7 +588,7 @@ fn execute_step(
         }
 
         Step::ReopenBackend {} => {
-            *backend = factory.open();
+            *backend = factory.reopen();
             StepOutcome::Ok(None)
         }
     }
@@ -778,12 +781,22 @@ mod tests {
         use tempfile::TempDir;
 
         struct FakeFactory {
-            state_root: std::path::PathBuf,
+            base: std::path::PathBuf,
+            counter: std::sync::Mutex<u64>,
+            current: std::sync::Mutex<std::path::PathBuf>,
         }
 
         impl BackendFactory for FakeFactory {
-            fn open(&self) -> Box<dyn CriBackend> {
-                Box::new(FakeBackend::open(&self.state_root).expect("FakeBackend::open"))
+            fn fresh(&self) -> Box<dyn CriBackend> {
+                let mut c = self.counter.lock().unwrap();
+                *c += 1;
+                let root = self.base.join(format!("vec-{}", *c));
+                *self.current.lock().unwrap() = root.clone();
+                Box::new(FakeBackend::open(&root).expect("FakeBackend::open"))
+            }
+            fn reopen(&self) -> Box<dyn CriBackend> {
+                let root = self.current.lock().unwrap().clone();
+                Box::new(FakeBackend::open(&root).expect("FakeBackend::reopen"))
             }
         }
 
@@ -791,7 +804,9 @@ mod tests {
         fn vectors_pass_on_fake() {
             let tmp = TempDir::new().expect("tempdir");
             let factory = FakeFactory {
-                state_root: tmp.path().to_path_buf(),
+                base: tmp.path().to_path_buf(),
+                counter: std::sync::Mutex::new(0),
+                current: std::sync::Mutex::new(tmp.path().to_path_buf()),
             };
 
             let manifest_dir =

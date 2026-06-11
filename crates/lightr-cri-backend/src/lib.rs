@@ -190,7 +190,8 @@ pub struct ContainerFilter {
 /// is sync; the shell bridges via spawn_blocking. Object-safe.
 ///
 /// State law (vectors encode this): sandbox Ready→NotReady (stop)→gone
-/// (remove). Container Created→Running→Exited; `start` only from Created;
+/// (remove). `create_container` requires the sandbox Ready (else
+/// FailedPrecondition). Container Created→Running→Exited; `start` only from Created;
 /// `stop` from Running (→Exited) or no-op from Created/Exited; `remove`
 /// refused (FailedPrecondition) while Running; removing a sandbox
 /// stops+removes its containers. All transitions persist BEFORE the call
