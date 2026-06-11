@@ -37,6 +37,7 @@ jobs:
     timeout-minutes: 45
     env:
       LIGHTR_CRI_REQUIRE_PROBES: "1"
+      LIGHTR_BUDGET_CLASS: shared-docker
     steps:
       - uses: actions/checkout@v4
 
@@ -105,7 +106,7 @@ jobs:
           PROTOC_ZIP="protoc-25.3-linux-x86_64.zip"
           curl -fsSL -o /tmp/protoc.zip \
             "https://github.com/protocolbuffers/protobuf/releases/download/v25.3/${PROTOC_ZIP}"
-          unzip -q /tmp/protoc.zip -d /tmp/protoc
+          rm -rf /tmp/protoc && unzip -oq /tmp/protoc.zip -d /tmp/protoc
           sudo mv /tmp/protoc/bin/protoc /usr/local/bin/protoc
           sudo chmod +x /usr/local/bin/protoc
           protoc --version

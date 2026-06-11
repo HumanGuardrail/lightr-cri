@@ -10,26 +10,28 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SERVER_BIN="${LIGHTR_CRI_BIN:-${REPO_ROOT}/target/release/lightr-cri}"
 
 RSS_LIMIT_KB=10240   # 10 MB
-PULL_P50_MS=50       # 50 ms
+
+# ── machine-class budgets (house doctrine, hugr-lightr lineage) ──────────────
+# The PRODUCT target (<50 ms, whitepaper §8) binds to the hosted-linux class
+# (bare-metal/VM Linux). On the shared-docker class (Docker-on-Mac — both the
+# local lane AND our self-hosted runner container) crictl wall-clock carries
+# virtualization + client-spawn overhead (~50-100 ms) that is not ours; the
+# class limit still catches real regressions (a resolve path that starts
+# moving bytes lands in the 100s of ms). Never detect "CI" — declare the
+# class explicitly via LIGHTR_BUDGET_CLASS.
+BUDGET_CLASS="${LIGHTR_BUDGET_CLASS:-hosted-linux}"
+case "${BUDGET_CLASS}" in
+  hosted-linux)  PULL_P50_MS=50 ;;
+  shared-docker) PULL_P50_MS=100 ;;
+  *) echo "ERROR: unknown LIGHTR_BUDGET_CLASS '${BUDGET_CLASS}'" >&2; exit 1 ;;
+esac
+SKIP_P50=0
+echo "budget class: ${BUDGET_CLASS} (pull p50 limit: ${PULL_P50_MS} ms; RSS: ${RSS_LIMIT_KB} KB)"
 
 # ── probe ────────────────────────────────────────────────────────────────────
 if ! command -v crictl >/dev/null 2>&1; then
   echo "SKIP budget.sh: crictl not in PATH (probe-truthful; macOS local run)" >&2
   exit 0
-fi
-
-# When NOT running in GitHub Actions (i.e., local Docker-on-macOS), skip the
-# p50 latency check: Docker-Mac virtualization adds ~50-100ms per gRPC call
-# (TUN/TAP bridge + hypervisor boundary) making the 50ms limit unattainable
-# regardless of implementation quality. The RSS check still runs (size is not
-# affected by virtualization overhead). Real CI (GitHub Actions Linux) enforces
-# both budgets at bare-metal latency.
-GITHUB_ACTIONS="${GITHUB_ACTIONS:-}"
-SKIP_P50=0
-if [ "${GITHUB_ACTIONS}" != "true" ]; then
-  SKIP_P50=1
-  echo "NOTE: p50 pull latency check SKIPPED (not in GitHub Actions; Docker-Mac" \
-       "virtualization overhead exceeds 50ms limit — probe-truthful on local runs)" >&2
 fi
 
 if [ ! -x "${SERVER_BIN}" ]; then
@@ -101,12 +103,17 @@ echo "OK: RSS within budget"
 
 # ── pull p50 ─────────────────────────────────────────────────────────────────
 if [ "${SKIP_P50}" -eq 1 ]; then
-  echo "SKIP: pull p50 latency check skipped (not GitHub Actions; Docker-Mac local run)"
+  echo "SKIP: pull p50 latency check skipped"
   echo ""
-  echo "OK: all budgets passed (RSS=${RSS_KB} KB, pull_p50=SKIPPED-local)"
+  echo "OK: all budgets passed (RSS=${RSS_KB} KB, pull_p50=SKIPPED)"
 else
   TIMES_FILE="${TMP_DIR}/pull_times.txt"
   : > "${TIMES_FILE}"
+
+  # warm-up: exclude cold-path noise (first gRPC connection, page cache)
+  for i in $(seq 1 3); do
+    crictl pull "ref/budget-warmup-${i}" >/dev/null 2>&1 || true
+  done
 
   echo "Running 20 crictl pull calls for p50 measurement..."
   for i in $(seq 1 20); do

@@ -11,6 +11,7 @@ exec docker run --rm \
   -e CARGO_TARGET_DIR=/work/target-linux \
   -e LIGHTR_CRI_BIN=/work/target-linux/release/lightr-cri \
   -e LIGHTR_CRI_REQUIRE_PROBES=1 \
+  -e LIGHTR_BUDGET_CLASS=shared-docker \
   rust:1.96-bookworm bash -ec '
     set -euo pipefail
     CRICTL_SHA=8307399e714626e69d1213a4cd18c8dec3d0201ecdac009b1802115df8973f0f
