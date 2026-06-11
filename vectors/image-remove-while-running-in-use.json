@@ -1,0 +1,12 @@
+{
+  "name": "image-remove-while-running-in-use",
+  "steps": [
+    { "op": "pull_image", "ref": "ref/busy-image:latest" },
+    { "op": "run_sandbox", "cfg": { "name": "s1", "uid": "u1", "namespace": "ns", "attempt": 0 } },
+    { "op": "create_container", "sandbox": "$1", "cfg": { "name": "c1", "attempt": 0, "image_ref": "ref/busy-image:latest", "command": ["/bin/sleep", "30"] } },
+    { "op": "start_container", "id": "$2" },
+    { "op": "remove_image", "ref": "ref/busy-image:latest", "expect_err": "InUse" },
+    { "op": "stop_container", "id": "$2", "grace_seconds": 0 },
+    { "op": "remove_sandbox", "id": "$1" }
+  ]
+}

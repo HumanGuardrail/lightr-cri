@@ -1,0 +1,12 @@
+{
+  "name": "image-pull-list-status-remove",
+  "steps": [
+    { "op": "list_images", "expect_count": 0 },
+    { "op": "pull_image", "ref": "ref/alpine:3.18" },
+    { "op": "list_images", "expect_count": 1 },
+    { "op": "image_status", "ref": "ref/alpine:3.18", "expect_present": true },
+    { "op": "remove_image", "ref": "ref/alpine:3.18" },
+    { "op": "list_images", "expect_count": 0 },
+    { "op": "image_status", "ref": "ref/alpine:3.18", "expect_present": false }
+  ]
+}
