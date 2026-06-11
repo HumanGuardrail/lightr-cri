@@ -1,0 +1,29 @@
+# critest skip-list for lightr-cri R0.
+# Format: one Ginkgo regex per line; inline comments after " #".
+# Reason tags: → R1 = deferred to R1; → OUT = out of R0 scope entirely.
+#
+# Each line: <ginkgo-regex> # reason → milestone
+
+# Streaming RPCs (Exec/Attach/PortForward) — UNIMPLEMENTED in R0
+\[Conformance\] runtime should support streaming exec # streaming → R1
+\[Conformance\] runtime should support streaming attach # streaming → R1
+\[Conformance\] runtime should support port forward # streaming → R1
+
+# CNI / network namespace setup — no CNI plugin in test environment
+\[Conformance\] runtime should support container network namespace # CNI → R1
+\[Conformance\] runtime should support network plugin # CNI → OUT
+
+# RuntimeConfig / UpdateRuntimeConfig — UNIMPLEMENTED in R0
+\[Conformance\] runtime should support updating runtime configuration # UpdateRuntimeConfig → R1
+
+# UpdateContainerResources — UNIMPLEMENTED in R0
+\[Conformance\] runtime should support updating container resources # UpdateContainerResources → R1
+
+# ReopenContainerLog — UNIMPLEMENTED in R0
+\[Conformance\] runtime should support reopening container log # ReopenContainerLog → R1
+
+# Checkpoint RPCs — UNIMPLEMENTED in R0
+\[Conformance\] runtime should support checkpoint # checkpoint → R1
+
+# GetContainerEvents / evented PLEG — UNIMPLEMENTED in R0
+\[Conformance\] runtime should support get container events # evented-PLEG → R1
