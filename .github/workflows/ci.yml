@@ -117,7 +117,7 @@ jobs:
           PROV="crates/lightr-cri-proto/PROVENANCE.md"
 
           # api.proto
-          EXPECTED_API=$(grep 'sha256:' "$PROV" | head -1 | awk '{print $2}' | tr -d '`')
+          EXPECTED_API=$(grep 'sha256:' "$PROV" | head -1 | grep -oE '[0-9a-f]{64}')
           ACTUAL_API=$(sha256sum crates/lightr-cri-proto/proto/api.proto | awk '{print $1}')
           if [ "$ACTUAL_API" != "$EXPECTED_API" ]; then
             echo "FAIL: api.proto sha256 mismatch"
