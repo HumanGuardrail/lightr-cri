@@ -24,11 +24,23 @@ impl<B: CriBackend> ImageShell<B> {
     }
 }
 
+/// Normalize a ref to the tagged form crictl/kubelet expect in repo_tags:
+/// a ref whose last path segment carries no `:tag` gets `:latest` appended
+/// (mirrors containerd's pull normalization; raw refs stay raw in the seam).
+fn tagged(ref_name: &str) -> String {
+    let last = ref_name.rsplit('/').next().unwrap_or(ref_name);
+    if last.contains(':') {
+        ref_name.to_string()
+    } else {
+        format!("{ref_name}:latest")
+    }
+}
+
 /// Convert a backend `ImageRecord` to a proto `Image`.
 fn record_to_proto(r: lightr_cri_backend::ImageRecord) -> Image {
     Image {
         id: r.id.clone(),
-        repo_tags: vec![r.ref_name.clone()],
+        repo_tags: vec![tagged(&r.ref_name)],
         repo_digests: vec![r.id.clone()],
         size: r.size,
         uid: None,
@@ -99,7 +111,7 @@ impl<B: CriBackend> ImageService for ImageShell<B> {
             .into_iter()
             .filter(|r| {
                 if let Some(ref needle) = filter_ref {
-                    r.ref_name == *needle || r.id == *needle
+                    r.ref_name == *needle || r.id == *needle || tagged(&r.ref_name) == *needle
                 } else {
                     true
                 }
@@ -175,6 +187,14 @@ mod tests {
         assert!(proto.uid.is_none());
         assert!(proto.spec.is_none());
         assert!(proto.username.is_empty());
+    }
+
+    #[test]
+    fn tagged_normalization() {
+        assert_eq!(tagged("ref/a3-test-image"), "ref/a3-test-image:latest");
+        assert_eq!(tagged("alpine:3.20"), "alpine:3.20");
+        assert_eq!(tagged("registry:5000/team/img"), "registry:5000/team/img:latest");
+        assert_eq!(tagged("registry:5000/team/img:v1"), "registry:5000/team/img:v1");
     }
 
     #[test]
