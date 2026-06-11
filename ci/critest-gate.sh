@@ -9,7 +9,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SKIPS_FILE="${REPO_ROOT}/ci/critest-skips.txt"
 GREENLIST="${REPO_ROOT}/tests/GREENLIST"
-SERVER_BIN="${REPO_ROOT}/target/release/lightr-cri"
+SERVER_BIN="${LIGHTR_CRI_BIN:-${REPO_ROOT}/target/release/lightr-cri}"
 
 # ── pre-flight ───────────────────────────────────────────────────────────────
 if ! command -v critest >/dev/null 2>&1; then

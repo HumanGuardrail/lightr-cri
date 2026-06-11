@@ -7,7 +7,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SERVER_BIN="${REPO_ROOT}/target/release/lightr-cri"
+SERVER_BIN="${LIGHTR_CRI_BIN:-${REPO_ROOT}/target/release/lightr-cri}"
 
 RSS_LIMIT_KB=10240   # 10 MB
 PULL_P50_MS=50       # 50 ms

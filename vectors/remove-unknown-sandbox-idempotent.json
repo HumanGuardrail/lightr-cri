@@ -1,0 +1,6 @@
+{
+  "name": "remove-unknown-sandbox-idempotent",
+  "steps": [
+    { "op": "remove_sandbox", "id": "sb-never-existed" }
+  ]
+}

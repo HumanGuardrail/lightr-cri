@@ -8,7 +8,7 @@ on:
 jobs:
   # ── macOS: compile + unit lanes (no crictl/critest) ──────────────────────
   mac-compile:
-    runs-on: macos-15
+    runs-on: [self-hosted, macos]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -17,6 +17,7 @@ jobs:
         run: |
           rustup toolchain install 1.96.0 --profile minimal --no-self-update
           rustup override set 1.96.0
+          rustup component add clippy
 
       - name: cargo build --workspace
         run: cargo build --workspace
@@ -32,7 +33,7 @@ jobs:
 
   # ── Linux: full conformance (vectors A9, fake, shell, acceptance A1–A8, A10) ──
   linux-conformance:
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux]
     timeout-minutes: 45
     env:
       LIGHTR_CRI_REQUIRE_PROBES: "1"
@@ -43,6 +44,7 @@ jobs:
         run: |
           rustup toolchain install 1.96.0 --profile minimal --no-self-update
           rustup override set 1.96.0
+          rustup component add clippy
 
       - name: cargo build --release --workspace
         run: cargo build --release --workspace
@@ -86,7 +88,7 @@ jobs:
 
   # ── verify-codegen: regenerate proto, diff must be empty ─────────────────
   verify-codegen:
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -95,6 +97,7 @@ jobs:
         run: |
           rustup toolchain install 1.96.0 --profile minimal --no-self-update
           rustup override set 1.96.0
+          rustup component add clippy
 
       - name: install pinned protoc v25.3
         run: |
