@@ -1,0 +1,5 @@
+# tests/GREENLIST — critest conquered items (no-regression contract).
+# Format: one critest spec name per line; '#' comments and blank lines ignored.
+# Items are added here when CI first passes a critest item on Linux CI (lead action).
+# NEVER edit this file to remove items — the gate is append-only.
+# Reference: build-spec-r0 §7 A10, §9 R0 exit law.

@@ -1,0 +1,51 @@
+# critest skip-list — frozen; one ginkgo regex per line.
+# Format: <regex>  # reason → R1
+# These are joined by | and passed to critest as --ginkgo.skip.
+# Conservative: skip whole Describe blocks by keyword to avoid
+# partial-suite fragility. Add conquered items to tests/GREENLIST instead.
+
+# Streaming RPCs (Exec/Attach/PortForward) — UNIMPLEMENTED in R0; returns gRPC
+# UNIMPLEMENTED per build-spec-r0 §5.
+[Ee]xec  # reason → R1
+[Aa]ttach  # reason → R1
+[Pp]ort[Ff]orward  # reason → R1
+[Ss]treaming  # reason → R1
+
+# CNI / networking-dependent suites — no CNI plugin in CI runner.
+[Nn]etwork  # reason → R1
+[Cc][Nn][Ii]  # reason → R1
+[Pp]od [Nn]etwork  # reason → R1
+should support.*[Nn]etwork  # reason → R1
+[Bb]andwidth  # reason → R1
+[Dd][Nn][Ss]  # reason → R1
+[Hh]ost[Nn]etwork  # reason → R1
+[Pp]ort [Mm]apping  # reason → R1
+
+# RuntimeConfig / UpdateRuntimeConfig — UNIMPLEMENTED in R0.
+[Rr]untime[Cc]onfig  # reason → R1
+[Uu]pdate[Rr]untime[Cc]onfig  # reason → R1
+[Rr]untime [Cc]onfig  # reason → R1
+
+# Container stats beyond basic (metrics descriptors, WritableLayer stats) —
+# fake backend returns zeroed values; descriptor-level assertions fail.
+[Ww]ritable[Ll]ayer  # reason → R1
+[Mm]etrics [Dd]escriptor  # reason → R1
+[Cc]ontainer[Ff][Ss][Ss]tats  # reason → R1
+[Ii]mage[Ff][Ss][Ss]tats  # reason → R1
+
+# Checkpoint/restore — UNIMPLEMENTED in R0.
+[Cc]heckpoint  # reason → R1
+[Rr]estore  # reason → R1
+
+# Events / GetContainerEvents — UNIMPLEMENTED in R0.
+[Ee]vent  # reason → R1
+[Cc]ontainer[Ee]vents  # reason → R1
+[Pp][Ll][Ee][Gg]  # reason → R1
+
+# UpdateContainerResources — UNIMPLEMENTED in R0.
+[Uu]pdate[Cc]ontainer[Rr]esources  # reason → R1
+[Rr]esource [Uu]pdate  # reason → R1
+
+# ReopenContainerLog — UNIMPLEMENTED in R0.
+[Rr]eopen  # reason → R1
+[Rr]eopen[Cc]ontainer[Ll]og  # reason → R1
