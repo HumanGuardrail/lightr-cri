@@ -1,0 +1,139 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  # ── macOS: compile + unit lanes (no crictl/critest) ──────────────────────
+  mac-compile:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust 1.96.0
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup override set 1.96.0
+
+      - name: cargo build --workspace
+        run: cargo build --workspace
+
+      - name: cargo clippy -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test (unit lanes)
+        run: |
+          cargo test -p lightr-cri-vectors \
+                     -p lightr-cri-fake \
+                     -p lightr-cri-shell
+
+  # ── Linux: full conformance (vectors A9, fake, shell, acceptance A1–A8, A10) ──
+  linux-conformance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust 1.96.0
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup override set 1.96.0
+
+      - name: cargo build --release --workspace
+        run: cargo build --release --workspace
+
+      - name: cargo clippy -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: install pinned cri-tools v1.33.0
+        run: |
+          set -euo pipefail
+          CRICTL_SHA256="8307399e714626e69d1213a4cd18c8dec3d0201ecdac009b1802115df8973f0f"
+          CRITEST_SHA256="31baec20eda89276b3466ec24cfdfc54258baf27651997db7b5d4205f60ea61b"
+          BASE="https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.33.0"
+
+          curl -fsSL -o /tmp/crictl.tar.gz "${BASE}/crictl-v1.33.0-linux-amd64.tar.gz"
+          echo "${CRICTL_SHA256}  /tmp/crictl.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/crictl.tar.gz -C /tmp
+          sudo mv /tmp/crictl /usr/local/bin/crictl
+          sudo chmod +x /usr/local/bin/crictl
+
+          curl -fsSL -o /tmp/critest.tar.gz "${BASE}/critest-v1.33.0-linux-amd64.tar.gz"
+          echo "${CRITEST_SHA256}  /tmp/critest.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/critest.tar.gz -C /tmp
+          sudo mv /tmp/critest /usr/local/bin/critest
+          sudo chmod +x /usr/local/bin/critest
+
+          crictl --version
+          critest --version
+
+      - name: cargo test --workspace (A9 vectors + fake + shell + acceptance A1–A8)
+        run: cargo test --workspace
+
+      - name: A10 critest gate
+        run: bash ci/critest-gate.sh
+
+      - name: budgets gate
+        run: bash ci/budget.sh
+
+      - name: greenlist gate
+        run: bash ci/greenlist-gate.sh
+
+  # ── verify-codegen: regenerate proto, diff must be empty ─────────────────
+  verify-codegen:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust 1.96.0
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup override set 1.96.0
+
+      - name: install pinned protoc v25.3
+        run: |
+          set -euo pipefail
+          PROTOC_ZIP="protoc-25.3-linux-x86_64.zip"
+          curl -fsSL -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v25.3/${PROTOC_ZIP}"
+          unzip -q /tmp/protoc.zip -d /tmp/protoc
+          sudo mv /tmp/protoc/bin/protoc /usr/local/bin/protoc
+          sudo chmod +x /usr/local/bin/protoc
+          protoc --version
+
+      - name: verify vendored proto sha256s against PROVENANCE.md
+        run: |
+          set -euo pipefail
+          PROV="crates/lightr-cri-proto/PROVENANCE.md"
+
+          # api.proto
+          EXPECTED_API=$(grep 'sha256:' "$PROV" | head -1 | awk '{print $2}' | tr -d '`')
+          ACTUAL_API=$(sha256sum crates/lightr-cri-proto/proto/api.proto | awk '{print $1}')
+          if [ "$ACTUAL_API" != "$EXPECTED_API" ]; then
+            echo "FAIL: api.proto sha256 mismatch"
+            echo "  expected: $EXPECTED_API"
+            echo "  actual:   $ACTUAL_API"
+            exit 1
+          fi
+          echo "OK: api.proto sha256 matches PROVENANCE.md"
+
+          # gogo.proto
+          EXPECTED_GOGO=$(grep 'sha256' "$PROV" | grep -oE '[0-9a-f]{64}' | tail -1)
+          ACTUAL_GOGO=$(sha256sum crates/lightr-cri-proto/proto/github.com/gogo/protobuf/gogoproto/gogo.proto | awk '{print $1}')
+          if [ "$ACTUAL_GOGO" != "$EXPECTED_GOGO" ]; then
+            echo "FAIL: gogo.proto sha256 mismatch"
+            echo "  expected: $EXPECTED_GOGO"
+            echo "  actual:   $ACTUAL_GOGO"
+            exit 1
+          fi
+          echo "OK: gogo.proto sha256 matches PROVENANCE.md"
+
+      - name: regenerate codegen
+        run: cargo run -p protogen
+
+      - name: diff generated (drift = red)
+        run: git diff --exit-code crates/lightr-cri-proto/src/generated/
