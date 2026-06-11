@@ -24,7 +24,7 @@ pub struct VectorReport {
 }
 
 /// Factory so each vector runs ISOLATED and crash-recovery vectors can drop
-/// + reopen the same state (`reopen_backend` step). The fake rotates state
+/// and reopen the same state (`reopen_backend` step). The fake rotates state
 /// roots per `fresh()`; the real backend will do the same at integration.
 pub trait BackendFactory {
     /// Fresh, isolated state for a new vector (no leakage between vectors).
@@ -667,10 +667,7 @@ mod tests {
         assert_eq!(variant_name(&BackendError::InUse("x".into())), "InUse");
         assert_eq!(variant_name(&BackendError::Internal("x".into())), "Internal");
         assert_eq!(
-            variant_name(&BackendError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "e"
-            ))),
+            variant_name(&BackendError::Io(std::io::Error::other("e"))),
             "Io"
         );
     }
