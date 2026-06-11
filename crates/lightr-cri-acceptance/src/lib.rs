@@ -23,7 +23,15 @@ pub fn have(bin: &str) -> bool {
 }
 
 /// Loud skip helper — prints the frozen skip format.
+///
+/// Fail-closed law: when `LIGHTR_CRI_REQUIRE_PROBES=1` (set in Linux CI,
+/// where crictl/critest are mandatory), a missing probe is a FAILURE, not a
+/// skip — otherwise the whole conformance suite could evaporate into green
+/// skips (cold-critic finding 2026-06-11).
 pub fn skip(item: &str, reason: &str) {
+    if std::env::var("LIGHTR_CRI_REQUIRE_PROBES").as_deref() == Ok("1") {
+        panic!("PROBE REQUIRED but missing — {item}: {reason} (LIGHTR_CRI_REQUIRE_PROBES=1)");
+    }
     eprintln!("SKIP {item}: {reason} (probe-truthful; see build-spec-r0 §7)");
 }
 
@@ -91,7 +99,12 @@ impl ServerHandle {
     /// Restart the server on an *existing* socket+state (A8 pattern).
     /// The caller owns `tmpdir` and must keep it alive; `keep_tmpdir=true` prevents
     /// the new handle from removing it on drop.
-    pub fn restart(bin: &Path, socket: PathBuf, state_dir: PathBuf, tmpdir: PathBuf) -> std::io::Result<Self> {
+    pub fn restart(
+        bin: &Path,
+        socket: PathBuf,
+        state_dir: PathBuf,
+        tmpdir: PathBuf,
+    ) -> std::io::Result<Self> {
         // Remove stale socket if present.
         let _ = std::fs::remove_file(&socket);
         Self::spawn_inner(bin, socket, state_dir, tmpdir, true)
@@ -116,7 +129,13 @@ impl ServerHandle {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             if socket.exists() {
-                return Ok(Self { child, socket, state_dir, tmpdir, keep_tmpdir });
+                return Ok(Self {
+                    child,
+                    socket,
+                    state_dir,
+                    tmpdir,
+                    keep_tmpdir,
+                });
             }
             std::thread::sleep(Duration::from_millis(50));
         }

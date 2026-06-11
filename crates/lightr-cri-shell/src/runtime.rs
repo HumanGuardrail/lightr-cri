@@ -14,8 +14,8 @@
 use std::sync::Arc;
 
 use lightr_cri_backend::{
-    CriBackend, ContainerFilter, ContainerState, SandboxFilter, SandboxId, ContainerId,
-    SandboxState, SandboxConfig, ContainerConfig, Mount,
+    ContainerConfig, ContainerFilter, ContainerId, ContainerState, CriBackend, Mount,
+    SandboxConfig, SandboxFilter, SandboxId, SandboxState,
 };
 use lightr_cri_proto::v1 as proto;
 use lightr_cri_proto::v1::runtime_service_server::RuntimeService;
@@ -84,19 +84,11 @@ fn proto_container_filter(f: Option<proto::ContainerFilter>) -> ContainerFilter 
             } else {
                 Some(SandboxId(f.pod_sandbox_id))
             },
-            state: f.state.map(|sv| {
-                match sv.state {
-                    x if x == proto::ContainerState::ContainerCreated as i32 => {
-                        ContainerState::Created
-                    }
-                    x if x == proto::ContainerState::ContainerRunning as i32 => {
-                        ContainerState::Running
-                    }
-                    x if x == proto::ContainerState::ContainerExited as i32 => {
-                        ContainerState::Exited
-                    }
-                    _ => ContainerState::Unknown,
-                }
+            state: f.state.map(|sv| match sv.state {
+                x if x == proto::ContainerState::ContainerCreated as i32 => ContainerState::Created,
+                x if x == proto::ContainerState::ContainerRunning as i32 => ContainerState::Running,
+                x if x == proto::ContainerState::ContainerExited as i32 => ContainerState::Exited,
+                _ => ContainerState::Unknown,
             }),
             label_selector: f.label_selector.into_iter().collect(),
         },
@@ -433,10 +425,7 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
         let meta = cfg_proto
             .metadata
             .ok_or_else(|| Status::invalid_argument("config.metadata is required"))?;
-        let image_ref = cfg_proto
-            .image
-            .map(|i| i.image)
-            .unwrap_or_default();
+        let image_ref = cfg_proto.image.map(|i| i.image).unwrap_or_default();
         let cfg = ContainerConfig {
             name: meta.name,
             attempt: meta.attempt,
@@ -583,14 +572,12 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking join error: {e}")))?
         .map_err(crate::map_err)?;
-        let status_map: std::collections::HashMap<
-            String,
-            lightr_cri_backend::ContainerStatus,
-        > = statuses
-            .unwrap_or_default()
-            .into_iter()
-            .map(|s| (s.id.0.clone(), s))
-            .collect();
+        let status_map: std::collections::HashMap<String, lightr_cri_backend::ContainerStatus> =
+            statuses
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| (s.id.0.clone(), s))
+                .collect();
         let stats = recs
             .iter()
             .map(|rec| {
@@ -643,7 +630,9 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
         &self,
         _request: Request<proto::PortForwardRequest>,
     ) -> Result<Response<proto::PortForwardResponse>, Status> {
-        Err(Status::unimplemented("PortForward: R1 — see whitepaper §11"))
+        Err(Status::unimplemented(
+            "PortForward: R1 — see whitepaper §11",
+        ))
     }
 
     type GetContainerEventsStream = GetContainerEventsStream;

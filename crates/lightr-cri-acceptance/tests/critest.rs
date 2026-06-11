@@ -25,7 +25,10 @@ fn critest_scoped() {
     let bin = match find_server_bin() {
         Some(b) => b,
         None => {
-            skip("A10/critest_scoped", "lightr-cri binary not found (build first or set LIGHTR_CRI_BIN)");
+            skip(
+                "A10/critest_scoped",
+                "lightr-cri binary not found (build first or set LIGHTR_CRI_BIN)",
+            );
             return;
         }
     };

@@ -22,8 +22,6 @@ pub fn map_err(e: BackendError) -> tonic::Status {
         BackendError::FailedPrecondition(_) | BackendError::InUse(_) => {
             tonic::Status::failed_precondition(e.to_string())
         }
-        BackendError::Internal(_) | BackendError::Io(_) => {
-            tonic::Status::internal(e.to_string())
-        }
+        BackendError::Internal(_) | BackendError::Io(_) => tonic::Status::internal(e.to_string()),
     }
 }

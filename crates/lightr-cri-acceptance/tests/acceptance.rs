@@ -26,7 +26,10 @@ macro_rules! common_probes {
         let bin = match find_server_bin() {
             Some(b) => b,
             None => {
-                skip($item, "lightr-cri binary not found (build first or set LIGHTR_CRI_BIN)");
+                skip(
+                    $item,
+                    "lightr-cri binary not found (build first or set LIGHTR_CRI_BIN)",
+                );
                 return;
             }
         };
@@ -55,8 +58,10 @@ fn write_pod_json(dir: &Path, name: &str, uid: &str) -> PathBuf {
 
 /// Write a minimal container config JSON to a temp file.
 fn write_container_json(dir: &Path, name: &str, image: &str, cmd: &[&str]) -> PathBuf {
-    let command: Vec<serde_json::Value> =
-        cmd.iter().map(|s| serde_json::Value::String(s.to_string())).collect();
+    let command: Vec<serde_json::Value> = cmd
+        .iter()
+        .map(|s| serde_json::Value::String(s.to_string()))
+        .collect();
     let json = serde_json::json!({
         "metadata": {
             "name": name,
@@ -128,7 +133,11 @@ fn a2_sandbox_lifecycle() {
 
     // runp
     let out = ctl(&srv.socket, &["runp", pod_json.to_str().unwrap()]).expect("crictl runp");
-    assert!(out.status.success(), "A2: runp failed\n{}", trim_output(&out.stderr));
+    assert!(
+        out.status.success(),
+        "A2: runp failed\n{}",
+        trim_output(&out.stderr)
+    );
     let pod_id = trim_output(&out.stdout);
     assert!(!pod_id.is_empty(), "A2: runp returned empty id");
 
@@ -144,11 +153,19 @@ fn a2_sandbox_lifecycle() {
 
     // stopp
     let out = ctl(&srv.socket, &["stopp", &pod_id]).expect("crictl stopp");
-    assert!(out.status.success(), "A2: stopp failed\n{}", trim_output(&out.stderr));
+    assert!(
+        out.status.success(),
+        "A2: stopp failed\n{}",
+        trim_output(&out.stderr)
+    );
 
     // rmp
     let out = ctl(&srv.socket, &["rmp", &pod_id]).expect("crictl rmp");
-    assert!(out.status.success(), "A2: rmp failed\n{}", trim_output(&out.stderr));
+    assert!(
+        out.status.success(),
+        "A2: rmp failed\n{}",
+        trim_output(&out.stderr)
+    );
 
     // pods no longer lists it
     let out = ctl(&srv.socket, &["pods"]).expect("crictl pods");
@@ -207,40 +224,70 @@ fn a4_container_lifecycle() {
 
     // runp
     let out = ctl(&srv.socket, &["runp", pod_json.to_str().unwrap()]).expect("runp");
-    assert!(out.status.success(), "A4: runp failed\n{}", trim_output(&out.stderr));
+    assert!(
+        out.status.success(),
+        "A4: runp failed\n{}",
+        trim_output(&out.stderr)
+    );
     let pod_id = trim_output(&out.stdout);
 
     // create
     let out = ctl(
         &srv.socket,
-        &["create", &pod_id, ctr_json.to_str().unwrap(), pod_json.to_str().unwrap()],
+        &[
+            "create",
+            &pod_id,
+            ctr_json.to_str().unwrap(),
+            pod_json.to_str().unwrap(),
+        ],
     )
     .expect("create");
-    assert!(out.status.success(), "A4: create failed\n{}", trim_output(&out.stderr));
+    assert!(
+        out.status.success(),
+        "A4: create failed\n{}",
+        trim_output(&out.stderr)
+    );
     let ctr_id = trim_output(&out.stdout);
     assert!(!ctr_id.is_empty(), "A4: create returned empty id");
 
     // start
     let out = ctl(&srv.socket, &["start", &ctr_id]).expect("start");
-    assert!(out.status.success(), "A4: start failed\n{}", trim_output(&out.stderr));
+    assert!(
+        out.status.success(),
+        "A4: start failed\n{}",
+        trim_output(&out.stderr)
+    );
 
     // ps shows Running
     let out = ctl(&srv.socket, &["ps"]).expect("ps");
     assert!(out.status.success(), "A4: ps failed");
     let ps_out = trim_output(&out.stdout);
     let prefix = &ctr_id[..ctr_id.len().min(12)];
-    assert!(ps_out.contains(prefix), "A4: running container {prefix} not in ps: {ps_out}");
-    assert!(ps_out.to_lowercase().contains("running"), "A4: container not Running in ps: {ps_out}");
+    assert!(
+        ps_out.contains(prefix),
+        "A4: running container {prefix} not in ps: {ps_out}"
+    );
+    assert!(
+        ps_out.to_lowercase().contains("running"),
+        "A4: container not Running in ps: {ps_out}"
+    );
 
     // stop (timeout 0)
     let out = ctl(&srv.socket, &["stop", "--timeout", "0", &ctr_id]).expect("stop");
-    assert!(out.status.success(), "A4: stop failed\n{}", trim_output(&out.stderr));
+    assert!(
+        out.status.success(),
+        "A4: stop failed\n{}",
+        trim_output(&out.stderr)
+    );
 
     // ps -a shows Exited
     let out = ctl(&srv.socket, &["ps", "-a"]).expect("ps -a");
     assert!(out.status.success(), "A4: ps -a failed");
     let ps_out = trim_output(&out.stdout);
-    assert!(ps_out.to_lowercase().contains("exited"), "A4: container not Exited in ps -a: {ps_out}");
+    assert!(
+        ps_out.to_lowercase().contains("exited"),
+        "A4: container not Exited in ps -a: {ps_out}"
+    );
 
     cleanup_dir(&tmpdir);
 }
@@ -262,14 +309,27 @@ fn a5_exec_sync() {
 
     let out = ctl(
         &srv.socket,
-        &["create", &pod_id, ctr_json.to_str().unwrap(), pod_json.to_str().unwrap()],
+        &[
+            "create",
+            &pod_id,
+            ctr_json.to_str().unwrap(),
+            pod_json.to_str().unwrap(),
+        ],
     )
     .expect("create");
-    assert!(out.status.success(), "A5: create failed\n{}", trim_output(&out.stderr));
+    assert!(
+        out.status.success(),
+        "A5: create failed\n{}",
+        trim_output(&out.stderr)
+    );
     let ctr_id = trim_output(&out.stdout);
 
     let out = ctl(&srv.socket, &["start", &ctr_id]).expect("start");
-    assert!(out.status.success(), "A5: start failed\n{}", trim_output(&out.stderr));
+    assert!(
+        out.status.success(),
+        "A5: start failed\n{}",
+        trim_output(&out.stderr)
+    );
 
     // exec --sync /bin/echo hi
     let out = ctl(&srv.socket, &["exec", "--sync", &ctr_id, "/bin/echo", "hi"]).expect("exec");
@@ -281,7 +341,10 @@ fn a5_exec_sync() {
         trim_output(&out.stderr),
     );
     let stdout = trim_output(&out.stdout);
-    assert!(stdout.contains("hi"), "A5: exec stdout does not contain 'hi': {stdout}");
+    assert!(
+        stdout.contains("hi"),
+        "A5: exec stdout does not contain 'hi': {stdout}"
+    );
 
     cleanup_dir(&tmpdir);
 }
@@ -303,10 +366,19 @@ fn a6_idempotency_cascade() {
 
     let out = ctl(
         &srv.socket,
-        &["create", &pod_id, ctr_json.to_str().unwrap(), pod_json.to_str().unwrap()],
+        &[
+            "create",
+            &pod_id,
+            ctr_json.to_str().unwrap(),
+            pod_json.to_str().unwrap(),
+        ],
     )
     .expect("create");
-    assert!(out.status.success(), "A6: create failed\n{}", trim_output(&out.stderr));
+    assert!(
+        out.status.success(),
+        "A6: create failed\n{}",
+        trim_output(&out.stderr)
+    );
     let ctr_id = trim_output(&out.stdout);
 
     let out = ctl(&srv.socket, &["start", &ctr_id]).expect("start");
@@ -314,13 +386,25 @@ fn a6_idempotency_cascade() {
 
     // stop twice — both must succeed (idempotent)
     let out = ctl(&srv.socket, &["stop", "--timeout", "0", &ctr_id]).expect("stop 1");
-    assert!(out.status.success(), "A6: first stop failed\n{}", trim_output(&out.stderr));
+    assert!(
+        out.status.success(),
+        "A6: first stop failed\n{}",
+        trim_output(&out.stderr)
+    );
     let out = ctl(&srv.socket, &["stop", "--timeout", "0", &ctr_id]).expect("stop 2");
-    assert!(out.status.success(), "A6: second stop failed\n{}", trim_output(&out.stderr));
+    assert!(
+        out.status.success(),
+        "A6: second stop failed\n{}",
+        trim_output(&out.stderr)
+    );
 
     // rm
     let out = ctl(&srv.socket, &["rm", &ctr_id]).expect("rm");
-    assert!(out.status.success(), "A6: rm failed\n{}", trim_output(&out.stderr));
+    assert!(
+        out.status.success(),
+        "A6: rm failed\n{}",
+        trim_output(&out.stderr)
+    );
 
     // rm again — graceful (crictl may return non-zero for "not found")
     let _ = ctl(&srv.socket, &["rm", &ctr_id]);
@@ -329,19 +413,36 @@ fn a6_idempotency_cascade() {
     let ctr_json2 = write_container_json(&tmpdir, "a6-ctr2", "ref/sleep", &["/bin/sleep", "30"]);
     let out = ctl(
         &srv.socket,
-        &["create", &pod_id, ctr_json2.to_str().unwrap(), pod_json.to_str().unwrap()],
+        &[
+            "create",
+            &pod_id,
+            ctr_json2.to_str().unwrap(),
+            pod_json.to_str().unwrap(),
+        ],
     )
     .expect("create2");
-    assert!(out.status.success(), "A6: create2 failed\n{}", trim_output(&out.stderr));
+    assert!(
+        out.status.success(),
+        "A6: create2 failed\n{}",
+        trim_output(&out.stderr)
+    );
     let ctr_id2 = trim_output(&out.stdout);
     let out = ctl(&srv.socket, &["start", &ctr_id2]).expect("start2");
     assert!(out.status.success(), "A6: start2 failed");
 
     // stopp + rmp — should cascade remove ctr_id2
     let out = ctl(&srv.socket, &["stopp", &pod_id]).expect("stopp");
-    assert!(out.status.success(), "A6: stopp failed\n{}", trim_output(&out.stderr));
+    assert!(
+        out.status.success(),
+        "A6: stopp failed\n{}",
+        trim_output(&out.stderr)
+    );
     let out = ctl(&srv.socket, &["rmp", &pod_id]).expect("rmp");
-    assert!(out.status.success(), "A6: rmp failed\n{}", trim_output(&out.stderr));
+    assert!(
+        out.status.success(),
+        "A6: rmp failed\n{}",
+        trim_output(&out.stderr)
+    );
 
     // ps -a should not list ctr_id2 anymore
     let out = ctl(&srv.socket, &["ps", "-a"]).expect("ps -a");
@@ -372,10 +473,19 @@ fn a7_stats() {
 
     let out = ctl(
         &srv.socket,
-        &["create", &pod_id, ctr_json.to_str().unwrap(), pod_json.to_str().unwrap()],
+        &[
+            "create",
+            &pod_id,
+            ctr_json.to_str().unwrap(),
+            pod_json.to_str().unwrap(),
+        ],
     )
     .expect("create");
-    assert!(out.status.success(), "A7: create failed\n{}", trim_output(&out.stderr));
+    assert!(
+        out.status.success(),
+        "A7: create failed\n{}",
+        trim_output(&out.stderr)
+    );
     let ctr_id = trim_output(&out.stdout);
 
     let out = ctl(&srv.socket, &["start", &ctr_id]).expect("start");
@@ -403,7 +513,10 @@ fn a8_crash_only() {
     let bin = common_probes!("A8");
     // A8 requires Linux /proc for pid verification.
     if !cfg!(target_os = "linux") {
-        skip("A8", "non-Linux: /proc-based pid verification not available");
+        skip(
+            "A8",
+            "non-Linux: /proc-based pid verification not available",
+        );
         return;
     }
 
@@ -423,10 +536,19 @@ fn a8_crash_only() {
 
     let out = ctl(
         &socket,
-        &["create", &pod_id, ctr_json.to_str().unwrap(), pod_json.to_str().unwrap()],
+        &[
+            "create",
+            &pod_id,
+            ctr_json.to_str().unwrap(),
+            pod_json.to_str().unwrap(),
+        ],
     )
     .expect("create");
-    assert!(out.status.success(), "A8: create failed\n{}", trim_output(&out.stderr));
+    assert!(
+        out.status.success(),
+        "A8: create failed\n{}",
+        trim_output(&out.stderr)
+    );
     let ctr_id = trim_output(&out.stdout);
 
     let out = ctl(&socket, &["start", &ctr_id]).expect("start");
@@ -457,7 +579,10 @@ fn a8_crash_only() {
         .arg(server_pid.to_string())
         .status()
         .expect("kill command");
-    assert!(kill_status.success(), "A8: kill -9 failed for server pid {server_pid}");
+    assert!(
+        kill_status.success(),
+        "A8: kill -9 failed for server pid {server_pid}"
+    );
     // Wait for the child to reap
     let _ = srv.child.wait();
 
@@ -471,8 +596,8 @@ fn a8_crash_only() {
     }
 
     // Restart server on SAME socket + state.
-    let srv2 = ServerHandle::restart(&bin, socket.clone(), state_dir, srv_tmpdir)
-        .expect("restart server");
+    let srv2 =
+        ServerHandle::restart(&bin, socket.clone(), state_dir, srv_tmpdir).expect("restart server");
 
     // Re-derive pods + ps after restart.
     let pods_after = trim_output(&ctl(&socket, &["pods"]).expect("pods after").stdout);

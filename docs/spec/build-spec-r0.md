@@ -299,7 +299,7 @@ reason when its probe fails — macOS lacks crictl/critest; never silent).
   conquered items recorded in `tests/GREENLIST`; regression = red
   (skill-004 GREENLIST law).
 
-Budgets (CI, release build): server RSS at idle after A1–A7 **<10 MB**;
+Budgets (CI, release build): server RSS at idle after A1–A7 **<10 MB** (CI gate, conservative; product target <5 MB per whitepaper §8);
 `PullImage` p50 **<50 ms** (fake). Recorded by `ci/budget.sh`; failures are
 red, not warnings. Tense law: these are CI gates on the fake backend, NOT
 product claims about the lightr backend.

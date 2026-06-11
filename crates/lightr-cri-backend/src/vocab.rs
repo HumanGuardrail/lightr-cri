@@ -41,9 +41,19 @@ impl fmt::Debug for Digest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Entry {
-    File { path: String, mode: u32, size: u64, digest: Digest },
-    Symlink { path: String, target: String },
-    Dir { path: String },
+    File {
+        path: String,
+        mode: u32,
+        size: u64,
+        digest: Digest,
+    },
+    Symlink {
+        path: String,
+        target: String,
+    },
+    Dir {
+        path: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

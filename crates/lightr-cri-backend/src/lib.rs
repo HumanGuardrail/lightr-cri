@@ -6,10 +6,14 @@ pub mod vocab;
 
 use std::collections::BTreeMap;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(transparent)]
 pub struct SandboxId(pub String);
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(transparent)]
 pub struct ContainerId(pub String);
 
@@ -219,7 +223,12 @@ pub trait CriBackend: Send + Sync + 'static {
     fn list_container_stats(&self, filter: &ContainerFilter) -> Result<Vec<ContainerStatsRec>>;
 
     // exec plane (R0: sync only)
-    fn exec_sync(&self, id: &ContainerId, cmd: &[String], timeout_seconds: i64) -> Result<ExecResult>;
+    fn exec_sync(
+        &self,
+        id: &ContainerId,
+        cmd: &[String],
+        timeout_seconds: i64,
+    ) -> Result<ExecResult>;
 
     // image plane (lazy law: pull_image MUST NOT move file bytes)
     fn pull_image(&self, image_ref: &str) -> Result<PulledImage>;

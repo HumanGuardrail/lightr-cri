@@ -12,8 +12,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use lightr_cri_backend::{
-    BackendError, CriBackend, ContainerConfig, ContainerState,
-    ContainerId, SandboxConfig, SandboxId, SandboxState,
+    BackendError, ContainerConfig, ContainerId, ContainerState, CriBackend, SandboxConfig,
+    SandboxId, SandboxState,
 };
 use serde::Deserialize;
 
@@ -175,10 +175,7 @@ fn variant_name(e: &BackendError) -> &'static str {
 // ── Single vector execution ──────────────────────────────────────────────────
 
 /// Run one vector. Returns Ok(()) on pass, Err(message) on first failure.
-fn run_vector(
-    factory: &dyn BackendFactory,
-    vector: &Vector,
-) -> Result<(), String> {
+fn run_vector(factory: &dyn BackendFactory, vector: &Vector) -> Result<(), String> {
     let mut backend: Box<dyn CriBackend> = factory.fresh();
     // results[i] = the String result of step i (None if step produced no id)
     let mut results: Vec<Option<String>> = Vec::new();
@@ -217,9 +214,7 @@ fn check_err_expectation<T>(
         (Ok(_), Some(expected)) => StepOutcome::Fail(format!(
             "{step_name}: expected error '{expected}' but call succeeded"
         )),
-        (Err(e), None) => StepOutcome::Fail(format!(
-            "{step_name}: unexpected error: {e}"
-        )),
+        (Err(e), None) => StepOutcome::Fail(format!("{step_name}: unexpected error: {e}")),
         (Err(e), Some(expected)) => {
             let actual = variant_name(&e);
             if actual == expected.as_str() {
@@ -242,9 +237,7 @@ fn execute_step(
     match step {
         Step::RunSandbox { cfg, expect_err } => {
             let result = backend.run_sandbox(cfg.clone());
-            check_err_expectation(result, expect_err, "run_sandbox", |id| {
-                Some(id.0)
-            })
+            check_err_expectation(result, expect_err, "run_sandbox", |id| Some(id.0))
         }
 
         Step::StopSandbox { id, expect_err } => {
@@ -306,9 +299,7 @@ fn execute_step(
         } => {
             let sid = SandboxId(subst(sandbox, results));
             let result = backend.create_container(&sid, cfg.clone());
-            check_err_expectation(result, expect_err, "create_container", |id| {
-                Some(id.0)
-            })
+            check_err_expectation(result, expect_err, "create_container", |id| Some(id.0))
         }
 
         Step::StartContainer { id, expect_err } => {
@@ -409,9 +400,7 @@ fn execute_step(
                     }
                     Err(e) => match expect_err {
                         None => {
-                            return StepOutcome::Fail(format!(
-                                "wait_exited: unexpected error: {e}"
-                            ))
+                            return StepOutcome::Fail(format!("wait_exited: unexpected error: {e}"))
                         }
                         Some(expected) => {
                             let actual = variant_name(&e);
@@ -454,8 +443,7 @@ fn execute_step(
                         }
                     }
                     if let Some(expected_out) = expect_stdout {
-                        let actual_out =
-                            String::from_utf8_lossy(&exec_result.stdout).into_owned();
+                        let actual_out = String::from_utf8_lossy(&exec_result.stdout).into_owned();
                         let actual_trimmed = actual_out.trim_end_matches('\n');
                         let expected_trimmed = expected_out.trim_end_matches('\n');
                         if actual_trimmed != expected_trimmed {
@@ -616,10 +604,9 @@ pub fn run_vectors(factory: &dyn BackendFactory, dir: &Path) -> std::io::Result<
         let vector: Vector = match serde_json::from_str(&raw) {
             Ok(v) => v,
             Err(e) => {
-                report.failed.push(format!(
-                    "parse error in {}: {e}",
-                    path.display()
-                ));
+                report
+                    .failed
+                    .push(format!("parse error in {}: {e}", path.display()));
                 continue;
             }
         };
@@ -660,12 +647,27 @@ mod tests {
 
     #[test]
     fn variant_name_coverage() {
-        assert_eq!(variant_name(&BackendError::NotFound("x".into())), "NotFound");
-        assert_eq!(variant_name(&BackendError::AlreadyExists("x".into())), "AlreadyExists");
-        assert_eq!(variant_name(&BackendError::InvalidArgument("x".into())), "InvalidArgument");
-        assert_eq!(variant_name(&BackendError::FailedPrecondition("x".into())), "FailedPrecondition");
+        assert_eq!(
+            variant_name(&BackendError::NotFound("x".into())),
+            "NotFound"
+        );
+        assert_eq!(
+            variant_name(&BackendError::AlreadyExists("x".into())),
+            "AlreadyExists"
+        );
+        assert_eq!(
+            variant_name(&BackendError::InvalidArgument("x".into())),
+            "InvalidArgument"
+        );
+        assert_eq!(
+            variant_name(&BackendError::FailedPrecondition("x".into())),
+            "FailedPrecondition"
+        );
         assert_eq!(variant_name(&BackendError::InUse("x".into())), "InUse");
-        assert_eq!(variant_name(&BackendError::Internal("x".into())), "Internal");
+        assert_eq!(
+            variant_name(&BackendError::Internal("x".into())),
+            "Internal"
+        );
         assert_eq!(
             variant_name(&BackendError::Io(std::io::Error::other("e"))),
             "Io"
@@ -712,7 +714,9 @@ mod tests {
         }"#;
         let v: Vector = serde_json::from_str(json).expect("parse");
         match &v.steps[0] {
-            Step::WaitExited { timeout_seconds, .. } => {
+            Step::WaitExited {
+                timeout_seconds, ..
+            } => {
                 assert_eq!(*timeout_seconds, 5);
             }
             _ => panic!("wrong step variant"),
@@ -748,8 +752,7 @@ mod tests {
     fn parse_all_example_vectors() {
         // Verify the two frozen examples parse without error.
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
-        let vectors_dir = std::path::Path::new(&manifest_dir)
-            .join("../../vectors");
+        let vectors_dir = std::path::Path::new(&manifest_dir).join("../../vectors");
         if !vectors_dir.exists() {
             return; // skip if not in repo context
         }
@@ -808,8 +811,7 @@ mod tests {
 
             let manifest_dir =
                 std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
-            let vectors_dir =
-                std::path::Path::new(&manifest_dir).join("../../vectors");
+            let vectors_dir = std::path::Path::new(&manifest_dir).join("../../vectors");
 
             let report = run_vectors(&factory, &vectors_dir).expect("run_vectors io error");
 
@@ -817,10 +819,7 @@ mod tests {
                 for failure in &report.failed {
                     eprintln!("FAILED: {failure}");
                 }
-                panic!(
-                    "{} vector(s) failed (see above)",
-                    report.failed.len()
-                );
+                panic!("{} vector(s) failed (see above)", report.failed.len());
             }
         }
     }

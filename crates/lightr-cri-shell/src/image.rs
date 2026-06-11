@@ -7,10 +7,10 @@ use std::sync::Arc;
 
 use lightr_cri_backend::CriBackend;
 use lightr_cri_proto::v1::{
-    image_service_server::ImageService,
-    FilesystemIdentifier, FilesystemUsage, Image, ImageFsInfoRequest, ImageFsInfoResponse,
-    ImageStatusRequest, ImageStatusResponse, ListImagesRequest, ListImagesResponse,
-    PullImageRequest, PullImageResponse, RemoveImageRequest, RemoveImageResponse, UInt64Value,
+    image_service_server::ImageService, FilesystemIdentifier, FilesystemUsage, Image,
+    ImageFsInfoRequest, ImageFsInfoResponse, ImageStatusRequest, ImageStatusResponse,
+    ListImagesRequest, ListImagesResponse, PullImageRequest, PullImageResponse, RemoveImageRequest,
+    RemoveImageResponse, UInt64Value,
 };
 use tonic::{Request, Response, Status};
 
@@ -69,11 +69,10 @@ impl<B: CriBackend> ImageService for ImageShell<B> {
             .map(|s| s.image)
             .unwrap_or_default();
         let backend = Arc::clone(&self.backend);
-        let maybe_record =
-            tokio::task::spawn_blocking(move || backend.image_status(&image_ref))
-                .await
-                .map_err(|e| Status::internal(format!("spawn_blocking join error: {e}")))?
-                .map_err(crate::map_err)?;
+        let maybe_record = tokio::task::spawn_blocking(move || backend.image_status(&image_ref))
+            .await
+            .map_err(|e| Status::internal(format!("spawn_blocking join error: {e}")))?
+            .map_err(crate::map_err)?;
         let image = maybe_record.map(record_to_proto);
         Ok(Response::new(ImageStatusResponse {
             image,

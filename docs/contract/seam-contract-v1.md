@@ -154,3 +154,5 @@ held".
 This is **v1**. Any breaking change to §1/§2/§3 semantics → v2 + explicit
 renegotiation with the Lightr session. Additive, serde-compatible evolution
 (new optional fields) is allowed with a minor note appended here.
+
+v1 note (2026-06-11): R0 trait omits `open_exec/open_attach` (StreamHandle) and pull auth — both are PLANNED additive v1.1 extensions for R1 streaming + private registries; declared here so R1 is an addition, not a renegotiation.

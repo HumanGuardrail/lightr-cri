@@ -4,8 +4,11 @@
 //! - File-backed: state root (env `LIGHTR_CRI_STATE`, default
 //!   `$TMPDIR/lightr-cri-fake`): `sandboxes/<id>.json`, `containers/<id>.json`,
 //!   `images/<name-hash>.json`. Atomic write law: tmp + rename, fsync file.
-//! - In-memory index is a CACHE rebuilt from disk at `open` — kill -9 at any
-//!   point loses nothing (acceptance A8 proves it).
+//! - In-memory index is a CACHE rebuilt from disk at `open`. Crash-recovery law:
+//!   survived processes are re-adopted; a kill between spawn and pid-persist
+//!   recovers as Exited/-1 'lost-start-window'; exit codes of containers that
+//!   exit while no listener is alive recover as -1 'lost-exit-reaped-elsewhere'
+//!   (fidelity limit of the fake; the real backend's supervisor closes it).
 //! - Execution is REAL: `start_container` spawns the configured command as a
 //!   plain host process (no isolation); `exec_sync` really runs and captures.
 //! - Images are fake CAS records: `pull_image` synthesizes PulledImage with a
@@ -101,8 +104,8 @@ fn atomic_write(dir: &Path, filename: &str, data: &[u8]) -> std::io::Result<()> 
 }
 
 fn atomic_write_json<T: serde::Serialize>(dir: &Path, filename: &str, value: &T) -> Result<()> {
-    let data = serde_json::to_vec(value)
-        .map_err(|e| BackendError::Internal(format!("serialize: {e}")))?;
+    let data =
+        serde_json::to_vec(value).map_err(|e| BackendError::Internal(format!("serialize: {e}")))?;
     atomic_write(dir, filename, &data).map_err(BackendError::Io)
 }
 
@@ -174,6 +177,17 @@ impl FakeBackend {
                             rec.reason = "lost-exit-reaped-elsewhere".to_string();
                             rec.finished_at_nanos = now_nanos();
                             // persist the corrected record
+                            let filename = format!("{}.json", rec.id.0);
+                            if let Ok(data2) = serde_json::to_vec(&rec) {
+                                let _ = atomic_write(&containers_dir, &filename, &data2);
+                            }
+                        } else if rec.pid == 0 {
+                            // Lost-start-window: Running persisted but pid never
+                            // written (crash between spawn and pid-persist).
+                            rec.state = ContainerState::Exited;
+                            rec.exit_code = -1;
+                            rec.reason = "lost-start-window".to_string();
+                            rec.finished_at_nanos = now_nanos();
                             let filename = format!("{}.json", rec.id.0);
                             if let Ok(data2) = serde_json::to_vec(&rec) {
                                 let _ = atomic_write(&containers_dir, &filename, &data2);
@@ -512,14 +526,11 @@ impl CriBackend for FakeBackend {
             }
         }
 
-        let child = cmd.spawn().map_err(|e| {
-            BackendError::Internal(format!("spawn container {}: {e}", id.0))
-        })?;
-
-        let child_pid = child.id();
+        // Crash-only law (cold-critic fix 2026-06-11): persist the START
+        // INTENT before spawning. If we die between spawn and the pid write,
+        // reopen sees Running+pid=0 → Exited/-1 "lost-start-window" instead
+        // of a phantom Created that could double-start.
         let started_at = now_nanos();
-
-        // Persist Running state with pid BEFORE returning
         {
             let mut cache = self.cache.lock().unwrap();
             let entry = cache
@@ -528,7 +539,48 @@ impl CriBackend for FakeBackend {
                 .ok_or_else(|| BackendError::NotFound(format!("container {}", id.0)))?;
             entry.state = ContainerState::Running;
             entry.started_at_nanos = started_at;
+            entry.pid = 0;
+            entry.reason = "starting".to_string();
+            let rec_clone = entry.clone();
+            drop(cache);
+            let filename = format!("{}.json", id.0);
+            atomic_write_json(&self.containers_dir, &filename, &rec_clone)?;
+        }
+
+        let child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                // Spawn failed: persist the truth (Exited) before erroring.
+                let mut cache = self.cache.lock().unwrap();
+                if let Some(entry) = cache.containers.get_mut(id) {
+                    entry.state = ContainerState::Exited;
+                    entry.finished_at_nanos = now_nanos();
+                    entry.exit_code = -1;
+                    entry.reason = "spawn-failed".to_string();
+                    entry.message = e.to_string();
+                    let rec_clone = entry.clone();
+                    drop(cache);
+                    let filename = format!("{}.json", id.0);
+                    let _ = atomic_write_json(&self.containers_dir, &filename, &rec_clone);
+                }
+                return Err(BackendError::Internal(format!(
+                    "spawn container {}: {e}",
+                    id.0
+                )));
+            }
+        };
+
+        let child_pid = child.id();
+
+        // Persist the real pid (intent → running)
+        {
+            let mut cache = self.cache.lock().unwrap();
+            let entry = cache
+                .containers
+                .get_mut(id)
+                .ok_or_else(|| BackendError::NotFound(format!("container {}", id.0)))?;
             entry.pid = child_pid;
+            entry.reason = String::new();
             let rec_clone = entry.clone();
             drop(cache);
             let filename = format!("{}.json", id.0);
@@ -719,7 +771,12 @@ impl CriBackend for FakeBackend {
 
     // ---- exec plane ----
 
-    fn exec_sync(&self, id: &ContainerId, cmd: &[String], timeout_seconds: i64) -> Result<ExecResult> {
+    fn exec_sync(
+        &self,
+        id: &ContainerId,
+        cmd: &[String],
+        timeout_seconds: i64,
+    ) -> Result<ExecResult> {
         let rec = {
             let cache = self.cache.lock().unwrap();
             cache
@@ -737,7 +794,9 @@ impl CriBackend for FakeBackend {
         }
 
         if cmd.is_empty() {
-            return Err(BackendError::InvalidArgument("exec_sync: empty command".to_string()));
+            return Err(BackendError::InvalidArgument(
+                "exec_sync: empty command".to_string(),
+            ));
         }
 
         let program = &cmd[0];
@@ -752,21 +811,28 @@ impl CriBackend for FakeBackend {
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
 
-        let mut child = command.spawn().map_err(|e| {
-            BackendError::Internal(format!("exec_sync spawn: {e}"))
-        })?;
+        let mut child = command
+            .spawn()
+            .map_err(|e| BackendError::Internal(format!("exec_sync spawn: {e}")))?;
 
         if timeout_seconds > 0 {
-            let deadline = std::time::Instant::now()
-                + std::time::Duration::from_secs(timeout_seconds as u64);
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds as u64);
 
             loop {
-                match child.try_wait().map_err(|e| BackendError::Internal(format!("try_wait: {e}")))? {
+                match child
+                    .try_wait()
+                    .map_err(|e| BackendError::Internal(format!("try_wait: {e}")))?
+                {
                     Some(status) => {
                         let stdout = read_child_output(&mut child, true);
                         let stderr = read_child_output(&mut child, false);
                         let exit_code = exit_code_from_status(&status);
-                        return Ok(ExecResult { exit_code, stdout, stderr });
+                        return Ok(ExecResult {
+                            exit_code,
+                            stdout,
+                            stderr,
+                        });
                     }
                     None => {
                         if std::time::Instant::now() >= deadline {
@@ -779,9 +845,9 @@ impl CriBackend for FakeBackend {
                 }
             }
         } else {
-            let output = child.wait_with_output().map_err(|e| {
-                BackendError::Internal(format!("exec_sync wait: {e}"))
-            })?;
+            let output = child
+                .wait_with_output()
+                .map_err(|e| BackendError::Internal(format!("exec_sync wait: {e}")))?;
             let exit_code = exit_code_from_status(&output.status);
             Ok(ExecResult {
                 exit_code,
@@ -1054,7 +1120,9 @@ mod tests {
         let mut cfg = minimal_sandbox_cfg("labeled");
         cfg.labels.insert("env".to_string(), "test".to_string());
         let id = backend.run_sandbox(cfg).unwrap();
-        backend.run_sandbox(minimal_sandbox_cfg("unlabeled")).unwrap();
+        backend
+            .run_sandbox(minimal_sandbox_cfg("unlabeled"))
+            .unwrap();
 
         let mut sel = BTreeMap::new();
         sel.insert("env".to_string(), "test".to_string());
@@ -1073,10 +1141,7 @@ mod tests {
     fn container_create_not_found_sandbox() {
         let (_dir, backend) = tmp_backend();
         let err = backend
-            .create_container(
-                &SandboxId("ghost".to_string()),
-                minimal_container_cfg("c"),
-            )
+            .create_container(&SandboxId("ghost".to_string()), minimal_container_cfg("c"))
             .unwrap_err();
         assert!(matches!(err, BackendError::NotFound(_)));
     }
@@ -1085,7 +1150,9 @@ mod tests {
     fn container_created_state() {
         let (_dir, backend) = tmp_backend();
         let sb = backend.run_sandbox(minimal_sandbox_cfg("sb")).unwrap();
-        let cid = backend.create_container(&sb, minimal_container_cfg("c")).unwrap();
+        let cid = backend
+            .create_container(&sb, minimal_container_cfg("c"))
+            .unwrap();
         let status = backend.container_status(&cid).unwrap();
         assert_eq!(status.state, ContainerState::Created);
         assert_eq!(status.started_at_nanos, 0);
@@ -1119,7 +1186,9 @@ mod tests {
     fn container_stop_idempotent() {
         let (_dir, backend) = tmp_backend();
         let sb = backend.run_sandbox(minimal_sandbox_cfg("sb")).unwrap();
-        let cid = backend.create_container(&sb, minimal_container_cfg("c")).unwrap();
+        let cid = backend
+            .create_container(&sb, minimal_container_cfg("c"))
+            .unwrap();
 
         // stop from Created is a no-op
         backend.stop_container(&cid, 0).unwrap();
@@ -1158,7 +1227,9 @@ mod tests {
     fn container_remove_idempotent() {
         let (_dir, backend) = tmp_backend();
         let sb = backend.run_sandbox(minimal_sandbox_cfg("sb")).unwrap();
-        let cid = backend.create_container(&sb, minimal_container_cfg("c")).unwrap();
+        let cid = backend
+            .create_container(&sb, minimal_container_cfg("c"))
+            .unwrap();
         backend.remove_container(&cid).unwrap();
         backend.remove_container(&cid).unwrap(); // second remove is no-op
     }
@@ -1187,14 +1258,18 @@ mod tests {
     #[test]
     fn start_nonexistent_container() {
         let (_dir, backend) = tmp_backend();
-        let err = backend.start_container(&ContainerId("ghost".to_string())).unwrap_err();
+        let err = backend
+            .start_container(&ContainerId("ghost".to_string()))
+            .unwrap_err();
         assert!(matches!(err, BackendError::NotFound(_)));
     }
 
     #[test]
     fn container_status_not_found() {
         let (_dir, backend) = tmp_backend();
-        let err = backend.container_status(&ContainerId("ghost".to_string())).unwrap_err();
+        let err = backend
+            .container_status(&ContainerId("ghost".to_string()))
+            .unwrap_err();
         assert!(matches!(err, BackendError::NotFound(_)));
     }
 
@@ -1204,7 +1279,9 @@ mod tests {
     fn exec_sync_requires_running() {
         let (_dir, backend) = tmp_backend();
         let sb = backend.run_sandbox(minimal_sandbox_cfg("sb")).unwrap();
-        let cid = backend.create_container(&sb, minimal_container_cfg("c")).unwrap();
+        let cid = backend
+            .create_container(&sb, minimal_container_cfg("c"))
+            .unwrap();
         let cmd = vec!["/bin/echo".to_string(), "hi".to_string()];
         let err = backend.exec_sync(&cid, &cmd, 0).unwrap_err();
         assert!(matches!(err, BackendError::FailedPrecondition(_)));
@@ -1240,7 +1317,11 @@ mod tests {
         let cid = backend.create_container(&sb, cfg).unwrap();
         backend.start_container(&cid).unwrap();
 
-        let cmd = vec!["/bin/sh".to_string(), "-c".to_string(), "exit 42".to_string()];
+        let cmd = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "exit 42".to_string(),
+        ];
         let result = backend.exec_sync(&cid, &cmd, 5).unwrap();
         assert_eq!(result.exit_code, 42);
 
@@ -1364,8 +1445,12 @@ mod tests {
         let (_dir, backend) = tmp_backend();
         let sb1 = backend.run_sandbox(minimal_sandbox_cfg("sb1")).unwrap();
         let sb2 = backend.run_sandbox(minimal_sandbox_cfg("sb2")).unwrap();
-        backend.create_container(&sb1, minimal_container_cfg("c1")).unwrap();
-        backend.create_container(&sb2, minimal_container_cfg("c2")).unwrap();
+        backend
+            .create_container(&sb1, minimal_container_cfg("c1"))
+            .unwrap();
+        backend
+            .create_container(&sb2, minimal_container_cfg("c2"))
+            .unwrap();
 
         let filter = ContainerFilter {
             sandbox: Some(sb1.clone()),
@@ -1380,7 +1465,9 @@ mod tests {
     fn list_containers_filter_state() {
         let (_dir, backend) = tmp_backend();
         let sb = backend.run_sandbox(minimal_sandbox_cfg("sb")).unwrap();
-        backend.create_container(&sb, minimal_container_cfg("c1")).unwrap();
+        backend
+            .create_container(&sb, minimal_container_cfg("c1"))
+            .unwrap();
         let mut cfg2 = minimal_container_cfg("c2");
         cfg2.command = vec!["/bin/sleep".to_string()];
         cfg2.args = vec!["60".to_string()];
@@ -1406,7 +1493,9 @@ mod tests {
         let mut cfg = minimal_container_cfg("labeled");
         cfg.labels.insert("tier".to_string(), "backend".to_string());
         let cid = backend.create_container(&sb, cfg).unwrap();
-        backend.create_container(&sb, minimal_container_cfg("unlabeled")).unwrap();
+        backend
+            .create_container(&sb, minimal_container_cfg("unlabeled"))
+            .unwrap();
 
         let mut sel = BTreeMap::new();
         sel.insert("tier".to_string(), "backend".to_string());
@@ -1442,7 +1531,9 @@ mod tests {
         let (sb_id, cid) = {
             let backend = FakeBackend::open(dir.path()).unwrap();
             let sb = backend.run_sandbox(minimal_sandbox_cfg("sb")).unwrap();
-            let cid = backend.create_container(&sb, minimal_container_cfg("c")).unwrap();
+            let cid = backend
+                .create_container(&sb, minimal_container_cfg("c"))
+                .unwrap();
             (sb, cid)
         };
         let backend2 = FakeBackend::open(dir.path()).unwrap();
@@ -1491,7 +1582,9 @@ mod tests {
     #[test]
     fn stats_not_found() {
         let (_dir, backend) = tmp_backend();
-        let err = backend.container_stats(&ContainerId("ghost".to_string())).unwrap_err();
+        let err = backend
+            .container_stats(&ContainerId("ghost".to_string()))
+            .unwrap_err();
         assert!(matches!(err, BackendError::NotFound(_)));
     }
 
@@ -1499,7 +1592,9 @@ mod tests {
     fn stats_not_running_returns_zeros() {
         let (_dir, backend) = tmp_backend();
         let sb = backend.run_sandbox(minimal_sandbox_cfg("sb")).unwrap();
-        let cid = backend.create_container(&sb, minimal_container_cfg("c")).unwrap();
+        let cid = backend
+            .create_container(&sb, minimal_container_cfg("c"))
+            .unwrap();
         let stats = backend.container_stats(&cid).unwrap();
         assert_eq!(stats.cpu_usage_core_nanos, 0);
         assert_eq!(stats.memory_working_set_bytes, 0);

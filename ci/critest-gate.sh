@@ -145,9 +145,22 @@ if [ "${REGRESSION}" -ne 0 ]; then
   exit 1
 fi
 
-if [ "${CRITEST_EXIT}" -ne 0 ]; then
+# Fail-closed law (cold-critic finding 2026-06-11): a broken runtime or a
+# broken parser must be RED, never a warning. Honest red over green lie.
+if [ "${#PASSED_ITEMS[@]}" -eq 0 ]; then
   echo "" >&2
-  echo "WARN: critest exited ${CRITEST_EXIT} (some non-greenlist items failed — expected while list is being conquered)" >&2
+  echo "FAIL: critest-gate: zero passed items extracted — either the runtime" >&2
+  echo "      failed everything or the ginkgo output parser no longer matches" >&2
+  echo "      critest v1.33.0 format. Record a real output sample and fix." >&2
+  exit 1
 fi
 
-echo "OK: critest-gate passed (no GREENLIST regressions)"
+if [ "${CRITEST_EXIT}" -ne 0 ]; then
+  echo "" >&2
+  echo "FAIL: critest exited ${CRITEST_EXIT}. Non-skipped items failed." >&2
+  echo "      Either conquer them (add to GREENLIST when green) or move them" >&2
+  echo "      to ci/critest-skips.txt with an explicit '# reason → R1' line." >&2
+  exit 1
+fi
+
+echo "OK: critest-gate passed (critest green on non-skipped set, no GREENLIST regressions)"

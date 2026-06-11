@@ -12,8 +12,7 @@ use std::sync::Arc;
 
 use lightr_cri_fake::FakeBackend;
 use lightr_cri_proto::v1::{
-    image_service_server::ImageServiceServer,
-    runtime_service_server::RuntimeServiceServer,
+    image_service_server::ImageServiceServer, runtime_service_server::RuntimeServiceServer,
 };
 use lightr_cri_shell::{ImageShell, RuntimeShell};
 use tokio::net::UnixListener;
@@ -81,11 +80,14 @@ fn main() {
     };
 
     let exit_code = rt.block_on(async move {
-        // Open the fake backend (todo!() compiles; real impl is WP-1).
+        // Open the fake backend (R0; the lightr backend arrives at integration).
         let backend = match FakeBackend::open(&state_path) {
             Ok(b) => Arc::new(b),
             Err(e) => {
-                eprintln!("lightr-cri: failed to open backend at {}: {e}", state_path.display());
+                eprintln!(
+                    "lightr-cri: failed to open backend at {}: {e}",
+                    state_path.display()
+                );
                 return 1;
             }
         };
@@ -93,7 +95,10 @@ fn main() {
         // Remove stale socket file if present.
         if socket_path.exists() {
             if let Err(e) = std::fs::remove_file(&socket_path) {
-                eprintln!("lightr-cri: failed to remove stale socket {}: {e}", socket_path.display());
+                eprintln!(
+                    "lightr-cri: failed to remove stale socket {}: {e}",
+                    socket_path.display()
+                );
                 return 1;
             }
         }
@@ -102,7 +107,10 @@ fn main() {
         if let Some(parent) = socket_path.parent() {
             if !parent.as_os_str().is_empty() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
-                    eprintln!("lightr-cri: failed to create socket directory {}: {e}", parent.display());
+                    eprintln!(
+                        "lightr-cri: failed to create socket directory {}: {e}",
+                        parent.display()
+                    );
                     return 1;
                 }
             }
@@ -137,12 +145,12 @@ fn main() {
         };
 
         let result = tonic::transport::Server::builder()
-            .add_service(RuntimeServiceServer::new(RuntimeShell::new(
-                Arc::clone(&backend),
-            )))
-            .add_service(ImageServiceServer::new(ImageShell::new(
-                Arc::clone(&backend),
-            )))
+            .add_service(RuntimeServiceServer::new(RuntimeShell::new(Arc::clone(
+                &backend,
+            ))))
+            .add_service(ImageServiceServer::new(ImageShell::new(Arc::clone(
+                &backend,
+            ))))
             .serve_with_incoming_shutdown(incoming, shutdown)
             .await;
 
