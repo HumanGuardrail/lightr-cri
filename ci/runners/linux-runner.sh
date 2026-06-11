@@ -18,7 +18,7 @@ docker run -d --name "${NAME}" --restart unless-stopped \
   -e RUNNER_ALLOW_RUNASROOT=1 -e TOKEN="${TOKEN}" -e RUNNER_VER="${RUNNER_VER}" \
   rust:1.96-bookworm bash -c '
     set -e
-    apt-get update -qq && apt-get install -y -qq libicu72 curl sudo unzip >/dev/null
+    apt-get update -qq && apt-get install -y -qq libicu72 curl sudo unzip jq >/dev/null
     mkdir -p /runner && cd /runner
     curl -fsSL -o runner.tgz "https://github.com/actions/runner/releases/download/v${RUNNER_VER}/actions-runner-linux-x64-${RUNNER_VER}.tar.gz"
     tar xzf runner.tgz && rm runner.tgz

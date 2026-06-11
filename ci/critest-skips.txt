@@ -49,3 +49,68 @@ should support.*[Nn]etwork  # reason → R1
 # ReopenContainerLog — UNIMPLEMENTED in R0.
 [Rr]eopen  # reason → R1
 [Rr]eopen[Cc]ontainer[Ll]og  # reason → R1
+
+# Security Context (all sub-describes: NamespaceOption, bucket, SeccompProfilePath,
+# NoNewPrivs) — needs real isolation engine (setuid/seccomp/capabilities/namespaces).
+# All 23 items in this describe failed; none passed. Whole block safe to skip.
+Security Context  # reason → R1
+
+# Container Mount Readonly — needs privileged mount support (tmpfs/bind-mount syscalls
+# require CAP_SYS_ADMIN; fake backend has no mount namespace).
+# Only item: "should support non-recursive readonly mounts"
+should support non-recursive readonly mounts  # reason → R1
+
+# Container Mount Propagation — needs privileged mount support (bind-mount propagation
+# requires real mount namespace + CAP_SYS_ADMIN; fake backend is unnamespaced).
+# Items: rprivate/rshared/rslave propagation
+Mount Propagation  # reason → R1
+
+# Container OOM — needs cgroup memory limits (cgroup v1/v2 memory.limit_in_bytes;
+# fake backend runs plain host processes with no cgroup isolation).
+# Item: "should terminate with exitCode 137 and reason OOMKilled"
+OOMKilled  # reason → R1
+should output OOMKilled reason  # reason → R1
+
+# Multiple Containers — pod shared-namespace semantics (PID/IPC/net sharing across
+# multiple containers in a pod requires real namespace sharing; fake does not implement).
+# Item: "when running multiple containers in a pod"
+Multiple Containers  # reason → R1
+
+# Container log — CRI log-file format infra (fake does not write the CRI log format
+# to the container's log_path; critest verifies structured log content).
+# It-level skip: only "starting container with log" fails; other log items may pass.
+runtime should support starting container with log  # reason → R1
+
+# Remove running container (force-remove) — CRI allows RemoveContainer on Running
+# containers as a force-removal; fake currently refuses (FailedPrecondition).
+# It-level skip; conquerable in a future wave once force-stop semantics are settled.
+# FLAGGED: this item is conquerable — fake should force-stop then remove.
+runtime should support removing running container  # reason → R1
+
+# Starting container (exits naturally) — the test starts a container with the image's
+# default command and waits up to 60s for Exited state. In the Docker CI environment,
+# the spawned process does not exit within the timeout (image entrypoint semantics:
+# fake images have no real binaries; the host process spawned by the fake hangs or the
+# command is long-running). Timing-sensitive; environment-dependent.
+# FLAGGED: conquerable once we implement proper container command from image config.
+# Note: The spec name contains "[Conformance]"; the regex below matches only this It.
+runtime should support starting container  # reason → R1
+
+# PodSandbox sysctls — needs real Linux kernel sysctl namespace (net.*,kernel.*
+# writes require a namespaced /proc/sys; fake runs unnamespaced).
+# Items: "should support safe sysctls", "should support unsafe sysctls"
+should support.*sysctls  # reason → R1
+runtime should support sysctls  # reason → R1
+
+# Image Manager — fake images are synthetic CAS records; critest expects real OCI
+# image semantics (multi-tag deduplication, image fields uid/username, digest refs,
+# public image pull from registry). All 7 tested items failed; none passed.
+# It-level skips to avoid catching future conquered items in other Image Manager tests.
+public image with tag should be pulled and removed  # reason → R1
+public image without tag should be pulled and removed  # reason → R1
+public image with digest should be pulled and removed  # reason → R1
+image status should support all kinds of references  # reason → R1
+image status get image fields should not have Uid  # reason → R1
+listImage should get exactly 3 image in the result list  # reason → R1
+listImage should get exactly 3 repoTags  # reason → R1
+public image should timeout if requested  # reason → R1

@@ -20,6 +20,7 @@ exec docker run --rm \
     echo "${CRICTL_SHA}  /tmp/crictl.tgz"  | sha256sum -c -
     curl -fsSL -o /tmp/critest.tgz "${BASE}/critest-v1.33.0-linux-amd64.tar.gz"
     echo "${CRITEST_SHA}  /tmp/critest.tgz" | sha256sum -c -
+    apt-get update -qq && apt-get install -y -qq jq >/dev/null
     tar -C /usr/local/bin -xzf /tmp/crictl.tgz
     tar -C /usr/local/bin -xzf /tmp/critest.tgz
     crictl --version && critest --version || true

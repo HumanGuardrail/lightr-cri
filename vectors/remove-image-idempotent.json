@@ -1,0 +1,10 @@
+{
+  "name": "remove-image-idempotent",
+  "steps": [
+    { "op": "remove_image", "ref": "never-pulled:latest" },
+    { "op": "remove_image", "ref": "never-pulled:latest" },
+    { "op": "pull_image", "ref": "real-img:v1" },
+    { "op": "remove_image", "ref": "real-img:v1" },
+    { "op": "remove_image", "ref": "real-img:v1" }
+  ]
+}

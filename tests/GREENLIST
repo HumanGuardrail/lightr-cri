@@ -5,3 +5,26 @@
 # Reference: build-spec-r0 §7 A10, §9 R0 exit law.
 # RED-UNTIL-CONQUERED: main CI is expected red until the first real critest run
 # populates this list (test-first law). R0 exit = this gate green and non-empty.
+#
+# Populated 2026-06-11 — R0 conquest wave: 21 items.
+[k8s.io] Container runtime should support basic operations on container runtime should support creating container [Conformance]
+[k8s.io] Container runtime should support basic operations on container runtime should support listing container stats [Conformance]
+[k8s.io] Container runtime should support basic operations on container runtime should support listing stats for containers filtered by labels [Conformance]
+[k8s.io] Container runtime should support basic operations on container runtime should support listing stats for started containers [Conformance]
+[k8s.io] Container runtime should support basic operations on container runtime should support listing stats for started containers when filter is nil [Conformance]
+[k8s.io] Container runtime should support basic operations on container runtime should support listing stats for three created containers when filter is nil. [Conformance]
+[k8s.io] Container runtime should support basic operations on container runtime should support removing created container [Conformance]
+[k8s.io] Container runtime should support basic operations on container runtime should support removing stopped container [Conformance]
+[k8s.io] Container runtime should support basic operations on container runtime should support stopping container [Conformance]
+[k8s.io] Idempotence RemoveContainer should not return an error if not found
+[k8s.io] Idempotence RemoveImage should not return an error if not found
+[k8s.io] Idempotence RemovePodSandbox should not return an error if not found
+[k8s.io] Idempotence StopContainer should not return an error if already stopped
+[k8s.io] Idempotence StopContainer should not return an error if not found
+[k8s.io] Idempotence StopPodSandbox should not return an error if already stopped
+[k8s.io] Idempotence StopPodSandbox should not return an error if not found
+[k8s.io] PodSandbox runtime should support basic operations on PodSandbox runtime should support removing PodSandbox [Conformance]
+[k8s.io] PodSandbox runtime should support basic operations on PodSandbox runtime should support running PodSandbox [Conformance]
+[k8s.io] PodSandbox runtime should support basic operations on PodSandbox runtime should support stopping PodSandbox [Conformance]
+[k8s.io] Runtime info runtime should support returning runtime info runtime should return runtime conditions [Conformance]
+[k8s.io] Runtime info runtime should support returning runtime info runtime should return version info [Conformance]

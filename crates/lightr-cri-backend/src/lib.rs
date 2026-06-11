@@ -234,6 +234,7 @@ pub trait CriBackend: Send + Sync + 'static {
     fn pull_image(&self, image_ref: &str) -> Result<PulledImage>;
     fn image_status(&self, image_ref: &str) -> Result<Option<ImageRecord>>;
     fn list_images(&self) -> Result<Vec<ImageRecord>>;
+    /// idempotent: not-found → Ok; refuses InUse while referenced by a live container
     fn remove_image(&self, image_ref: &str) -> Result<()>;
     fn image_fs_info(&self) -> Result<FsInfo>;
 }

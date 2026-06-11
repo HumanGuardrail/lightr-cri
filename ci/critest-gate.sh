@@ -17,6 +17,11 @@ if ! command -v critest >/dev/null 2>&1; then
   exit 0
 fi
 
+if ! command -v jq >/dev/null 2>&1; then
+  echo "ERROR: jq not in PATH; required for JSON report parsing (install: apt-get install -y jq)" >&2
+  exit 1
+fi
+
 if [ ! -x "${SERVER_BIN}" ]; then
   echo "ERROR: ${SERVER_BIN} not found; run cargo build --release first" >&2
   exit 1
@@ -66,30 +71,32 @@ SKIP_REGEX=$(grep -v '^\s*#' "${SKIPS_FILE}" | grep -v '^\s*$' \
 
 # ── run critest ──────────────────────────────────────────────────────────────
 CRITEST_OUT="${TMP_DIR}/critest.out"
+CRITEST_JSON="${TMP_DIR}/critest-report.json"
 echo "Running critest (skip: ${SKIP_REGEX:-<none>})"
 set +e
 critest \
   --runtime-endpoint "unix://${SOCKET}" \
   --ginkgo.skip "${SKIP_REGEX}" \
   --ginkgo.v \
+  --ginkgo.json-report "${CRITEST_JSON}" \
   2>&1 | tee "${CRITEST_OUT}"
 CRITEST_EXIT=$?
 set -e
 
-# ── parse passed items ───────────────────────────────────────────────────────
-# critest/ginkgo marks passed items with "[It]" and "PASSED" or the final
-# "[PASS]" summary per spec.  We extract the spec names from "passed" lines.
-# Ginkgo v2 format: lines like "  [It] <spec name>" followed by "[PASSED]"
-# or in summary: "• [PASS] <spec name>".
-# We capture both formats conservatively.
-mapfile -t PASSED_ITEMS < <(
-  grep -E '^\s+\[It\]|\[PASS\]|--- PASS:' "${CRITEST_OUT}" \
-    | sed -E 's/^\s+\[It\] //' \
-          -e 's/^.*\[PASS\] //' \
-          -e 's/^--- PASS: //' \
-          -e 's/ \(.*$//' \
-    | sed 's/^[[:space:]]*//' | grep -v '^$' | sort -u
-)
+# ── parse passed items from JSON report ──────────────────────────────────────
+# SpecReports[].State == "passed"; full name = ContainerHierarchyTexts joined + " " + LeafNodeText
+# Fail-closed: if jq fails or JSON missing → RED (zero-extracted check catches this).
+PASSED_ITEMS=()
+if [ -f "${CRITEST_JSON}" ]; then
+  mapfile -t PASSED_ITEMS < <(
+    jq -r '
+      .[] | .SpecReports[]
+      | select(.State == "passed")
+      | ((.ContainerHierarchyTexts // []) | join(" ")) + " " + (.LeafNodeText // "")
+      | ltrimstr(" ") | rtrimstr(" ")
+    ' "${CRITEST_JSON}" 2>/dev/null | grep -v '^$' | sort -u
+  )
+fi
 
 # ── GREENLIST enforcement ────────────────────────────────────────────────────
 REGRESSION=0
@@ -150,8 +157,8 @@ fi
 if [ "${#PASSED_ITEMS[@]}" -eq 0 ]; then
   echo "" >&2
   echo "FAIL: critest-gate: zero passed items extracted — either the runtime" >&2
-  echo "      failed everything or the ginkgo output parser no longer matches" >&2
-  echo "      critest v1.33.0 format. Record a real output sample and fix." >&2
+  echo "      failed everything or the JSON report is missing/malformed." >&2
+  echo "      Check that jq is installed and critest produced ${CRITEST_JSON}." >&2
   exit 1
 fi
 

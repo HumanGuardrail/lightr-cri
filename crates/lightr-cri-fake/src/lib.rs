@@ -620,10 +620,15 @@ impl CriBackend for FakeBackend {
                     entry.exit_code = exit_code;
                     entry.finished_at_nanos = finished_at;
                     entry.reason = reason;
+                    // Persist to disk BEFORE releasing the lock so that
+                    // reopen_backend (crash-recovery vectors) always sees the
+                    // final exit code. Without this, a race between the lock
+                    // release and the disk write means a concurrent reopen can
+                    // read the old Running record and set exit_code = -1.
                     let rec_clone = entry.clone();
-                    drop(cache);
                     let filename = format!("{}.json", cid.0);
                     let _ = atomic_write_json(&containers_dir, &filename, &rec_clone);
+                    // drop(cache) implicit at scope end
                 }
             }
         });
@@ -926,7 +931,7 @@ impl CriBackend for FakeBackend {
                 .map(|r| r.id.clone())
         };
         let img_id = match img_id {
-            None => return Err(BackendError::NotFound(format!("image {image_ref}"))),
+            None => return Ok(()), // idempotent: not-found → Ok (CRI law)
             Some(id) => id,
         };
 
@@ -1383,10 +1388,12 @@ mod tests {
     }
 
     #[test]
-    fn remove_image_not_found() {
+    fn remove_image_not_found_is_ok() {
+        // CRI law: removing a missing image is idempotent — not-found → Ok
         let (_dir, backend) = tmp_backend();
-        let err = backend.remove_image("not:there").unwrap_err();
-        assert!(matches!(err, BackendError::NotFound(_)));
+        backend.remove_image("not:there").unwrap(); // must succeed
+        // double-remove also Ok
+        backend.remove_image("not:there").unwrap();
     }
 
     #[test]
