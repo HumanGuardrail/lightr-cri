@@ -20,6 +20,10 @@ jobs:
 
       - name: install rust 1.96.0
         run: |
+          # Runner-agnostic: ~/.cargo/bin (rustup lives here) may not be on the
+          # service runner's PATH (.path resets on runner update). Prepend it.
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           rustup toolchain install 1.96.0 --profile minimal --no-self-update
           rustup override set 1.96.0
           rustup component add clippy
@@ -53,6 +57,10 @@ jobs:
 
       - name: install rust 1.96.0
         run: |
+          # Runner-agnostic: ~/.cargo/bin (rustup lives here) may not be on the
+          # service runner's PATH (.path resets on runner update). Prepend it.
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           rustup toolchain install 1.96.0 --profile minimal --no-self-update
           rustup override set 1.96.0
           rustup component add clippy
@@ -162,6 +170,10 @@ jobs:
 
       - name: install rust 1.96.0
         run: |
+          # Runner-agnostic: ~/.cargo/bin (rustup lives here) may not be on the
+          # service runner's PATH (.path resets on runner update). Prepend it.
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           rustup toolchain install 1.96.0 --profile minimal --no-self-update
           rustup override set 1.96.0
           rustup component add clippy
