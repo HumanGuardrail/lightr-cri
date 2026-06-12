@@ -1,0 +1,17 @@
+[package]
+name = "lightr-cri-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# FIREWALL: no tonic/tokio (sync, like backend — build-spec-r1 §3 WP-B)
+[dependencies]
+lightr-cri-backend = { path = "../lightr-cri-backend" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+libc = { workspace = true }
+nix = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

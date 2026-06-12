@@ -343,6 +343,8 @@ fn sandbox_rec_to_status(rec: &SandboxRecord) -> SandboxStatus {
         config: rec.config.clone(),
         state: rec.state,
         created_at_nanos: rec.created_at_nanos,
+        ip: None,         // WP-D wires these (build-spec-r1 §3)
+        netns_path: None, // WP-D wires these (build-spec-r1 §3)
     }
 }
 
@@ -1028,6 +1030,10 @@ mod tests {
             labels: Default::default(),
             annotations: Default::default(),
             log_directory: String::new(),
+            hostname: String::new(),
+            host_network: false,
+            dns: None,
+            port_mappings: vec![],
         }
     }
 
@@ -1044,6 +1050,8 @@ mod tests {
             labels: Default::default(),
             annotations: Default::default(),
             log_path: String::new(),
+            tty: false,
+            stdin: false,
         }
     }
 
@@ -1392,7 +1400,7 @@ mod tests {
         // CRI law: removing a missing image is idempotent — not-found → Ok
         let (_dir, backend) = tmp_backend();
         backend.remove_image("not:there").unwrap(); // must succeed
-        // double-remove also Ok
+                                                    // double-remove also Ok
         backend.remove_image("not:there").unwrap();
     }
 

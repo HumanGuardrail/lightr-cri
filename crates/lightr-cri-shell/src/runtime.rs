@@ -340,6 +340,10 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
             labels: pod_cfg.labels.into_iter().collect(),
             annotations: pod_cfg.annotations.into_iter().collect(),
             log_directory: pod_cfg.log_directory,
+            hostname: String::new(), // WP-D wires these (build-spec-r1 §3)
+            host_network: false,     // WP-D wires these (build-spec-r1 §3)
+            dns: None,               // WP-D wires these (build-spec-r1 §3)
+            port_mappings: vec![],   // WP-D wires these (build-spec-r1 §3)
         };
         let backend = Arc::clone(&self.backend);
         let id = tokio::task::spawn_blocking(move || backend.run_sandbox(cfg))
@@ -450,6 +454,8 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
             labels: cfg_proto.labels.into_iter().collect(),
             annotations: cfg_proto.annotations.into_iter().collect(),
             log_path: cfg_proto.log_path,
+            tty: false,   // WP-D wires these (build-spec-r1 §3)
+            stdin: false, // WP-D wires these (build-spec-r1 §3)
         };
         let backend = Arc::clone(&self.backend);
         let id = tokio::task::spawn_blocking(move || backend.create_container(&sandbox_id, cfg))

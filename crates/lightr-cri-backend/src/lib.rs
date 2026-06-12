@@ -1,10 +1,61 @@
 //! The seam crate: vocabulary types + the `CriBackend` trait.
 //! FROZEN per docs/spec/build-spec-r0.md §3 and docs/contract/seam-contract-v1.md.
+//! v1.1 additions per docs/contract/seam-contract-v1.1.md (FROZEN 2026-06-12).
 //! Agents transcribe; nobody edits this crate without owner sign-off.
 
 pub mod vocab;
 
 use std::collections::BTreeMap;
+
+// ── §A Vocabulary additions (v1.1) ───────────────────────────────────────────
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DnsConfig {
+    pub servers: Vec<String>,
+    pub searches: Vec<String>,
+    pub options: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Protocol {
+    Tcp,
+    Udp,
+    Sctp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PortMapping {
+    pub protocol: Protocol,
+    pub container_port: i32,
+    pub host_port: i32,
+    #[serde(default)]
+    pub host_ip: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AuthConfig {
+    pub username: String,
+    pub password: String,
+    pub auth: String,
+    pub server_address: String,
+}
+
+// ── §B Streaming sessions (v1.1) ─────────────────────────────────────────────
+
+/// Exit waiter — consumed once.
+pub trait ExitWaiter: Send {
+    fn wait(self: Box<Self>) -> Result<i32>;
+}
+
+/// Live I/O of an exec or attach session. tty=true → stdout carries the
+/// pty stream, stderr is None, pty_master enables TIOCSWINSZ resize.
+pub struct StreamSession {
+    pub stdin: Option<std::fs::File>,
+    pub stdout: Option<std::fs::File>,
+    pub stderr: Option<std::fs::File>,
+    pub pty_master: Option<std::fs::File>,
+    pub waiter: Box<dyn ExitWaiter>,
+}
 
 #[derive(
     Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
@@ -29,6 +80,15 @@ pub struct SandboxConfig {
     pub annotations: BTreeMap<String, String>,
     #[serde(default)]
     pub log_directory: String,
+    // v1.1 additions (all serde(default) — old state files load unchanged)
+    #[serde(default)]
+    pub hostname: String,
+    #[serde(default)]
+    pub host_network: bool,
+    #[serde(default)]
+    pub dns: Option<DnsConfig>,
+    #[serde(default)]
+    pub port_mappings: Vec<PortMapping>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -43,6 +103,11 @@ pub struct SandboxStatus {
     pub config: SandboxConfig,
     pub state: SandboxState,
     pub created_at_nanos: i64,
+    // v1.1 additions
+    #[serde(default)]
+    pub ip: Option<String>,
+    #[serde(default)]
+    pub netns_path: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -73,6 +138,11 @@ pub struct ContainerConfig {
     pub annotations: BTreeMap<String, String>,
     #[serde(default)]
     pub log_path: String,
+    // v1.1 additions
+    #[serde(default)]
+    pub tty: bool,
+    #[serde(default)]
+    pub stdin: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -237,4 +307,27 @@ pub trait CriBackend: Send + Sync + 'static {
     /// idempotent: not-found → Ok; refuses InUse while referenced by a live container
     fn remove_image(&self, image_ref: &str) -> Result<()>;
     fn image_fs_info(&self) -> Result<FsInfo>;
+
+    // v1.1 streaming methods — default impls so v1-only backends compile
+    fn open_exec(
+        &self,
+        _id: &ContainerId,
+        _cmd: &[String],
+        _tty: bool,
+        _stdin: bool,
+    ) -> Result<StreamSession> {
+        Err(BackendError::Internal("v1.1 not implemented".to_string()))
+    }
+    /// Attach to the container's live stdio (spawned with held pipes/pty).
+    fn open_attach(&self, _id: &ContainerId) -> Result<StreamSession> {
+        Err(BackendError::Internal("v1.1 not implemented".to_string()))
+    }
+    /// Auth-aware pull; default delegates to pull_image (auth ignored = fake-honest).
+    fn pull_image_with_auth(
+        &self,
+        image_ref: &str,
+        _auth: Option<&AuthConfig>,
+    ) -> Result<PulledImage> {
+        self.pull_image(image_ref)
+    }
 }
