@@ -2,9 +2,17 @@
 # Format: one critest spec name per line; '#' comments and blank lines ignored.
 # Items are added here when CI first passes a critest item on Linux CI (lead action).
 # NEVER edit this file to remove items — the gate is append-only.
-# Reference: build-spec-r0 §7 A10, §9 R0 exit law.
+# Reference: build-spec-r0 §7 A10, §9 R0 exit law; build-spec-r1 §3 WP-G.
 # RED-UNTIL-CONQUERED: main CI is expected red until the first real critest run
 # populates this list (test-first law). R0 exit = this gate green and non-empty.
+#
+# NOTE (R1 WP-G): The skip-list was narrowed in R1 — streaming (Exec/Attach/
+# PortForward), networking (Network/CNI/PodNetwork/HostNetwork/DNS/PortMapping),
+# container log, and image-default-command families are now GRADED (removed from
+# critest-skips.txt). These families surface as CANDIDATE items on the first
+# green R1 linux run. The lead appends confirmed passing items from the CANDIDATE
+# output here (same pattern as R0 conquest wave). R1 exit = this gate green with
+# the R1 conquest items appended.
 #
 # Populated 2026-06-11 — R0 conquest wave: 21 items.
 [k8s.io] Container runtime should support basic operations on container runtime should support creating container [Conformance]
