@@ -22,7 +22,10 @@ RSS_LIMIT_KB=10240   # 10 MB
 BUDGET_CLASS="${LIGHTR_BUDGET_CLASS:-hosted-linux}"
 case "${BUDGET_CLASS}" in
   hosted-linux)  PULL_P50_MS=50 ;;
-  shared-docker) PULL_P50_MS=100 ;;
+  # 250 ms: observed 51-150 ms pure crictl-spawn+virtualization noise under
+  # host load; the law this guards (resolve-only) breaks in SECONDS when
+  # violated, so 250 still catches any real regression on this class.
+  shared-docker) PULL_P50_MS=250 ;;
   *) echo "ERROR: unknown LIGHTR_BUDGET_CLASS '${BUDGET_CLASS}'" >&2; exit 1 ;;
 esac
 SKIP_P50=0
