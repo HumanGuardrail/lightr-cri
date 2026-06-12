@@ -330,4 +330,11 @@ pub trait CriBackend: Send + Sync + 'static {
     ) -> Result<PulledImage> {
         self.pull_image(image_ref)
     }
+    /// Honest network readiness for the CRI `Status.NetworkReady` condition
+    /// (probe-truthful law, contract §D). Default false: a backend that does
+    /// not wire CNI must NOT claim the pod network is ready. The fake
+    /// overrides this to reflect `cni_available()`.
+    fn network_ready(&self) -> bool {
+        false
+    }
 }

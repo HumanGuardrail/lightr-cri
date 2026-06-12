@@ -8,6 +8,7 @@ publish = false
 # FIREWALL: no tonic/prost/tokio here (seam-contract-v1 §0).
 [dependencies]
 lightr-cri-backend = { path = "../lightr-cri-backend" }
+lightr-cri-net = { path = "../lightr-cri-net" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 blake3 = { workspace = true }

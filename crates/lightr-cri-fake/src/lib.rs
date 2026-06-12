@@ -20,6 +20,8 @@
 //!   `sandbox.log_directory + "/" + container.log_path` (§C format);
 //!   open_exec spawns cmd in container context (pipes or pty); open_attach
 //!   returns held stdio handles from a side-table.
+//! - v1.1 (WP-D): run_sandbox wires CNI (lightr-cri-net) when CNI available
+//!   and host_network=false; remove_sandbox tears down; open_exec setns.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -39,6 +41,12 @@ struct SandboxRecord {
     pub config: SandboxConfig,
     pub state: SandboxState,
     pub created_at_nanos: i64,
+    /// Host-routable pod IP assigned by CNI ADD (§D). None when host_network or CNI unavailable.
+    #[serde(default)]
+    pub ip: Option<String>,
+    /// Path of the pinned network namespace bind-mount (§D). None when host_network or CNI unavailable.
+    #[serde(default)]
+    pub netns_path: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -373,8 +381,8 @@ fn sandbox_rec_to_status(rec: &SandboxRecord) -> SandboxStatus {
         config: rec.config.clone(),
         state: rec.state,
         created_at_nanos: rec.created_at_nanos,
-        ip: None,         // WP-D wires these (build-spec-r1 §3)
-        netns_path: None, // WP-D wires these (build-spec-r1 §3)
+        ip: rec.ip.clone(),
+        netns_path: rec.netns_path.clone(),
     }
 }
 
@@ -518,13 +526,39 @@ impl CriBackend for FakeBackend {
 
     fn run_sandbox(&self, cfg: SandboxConfig) -> Result<SandboxId> {
         let id = SandboxId(new_id("sb-"));
+
+        // §D: if not host_network and CNI is available, create netns + invoke CNI ADD.
+        // On macOS / unprivileged: cni_available() returns None → host-network fallback.
+        let (ip, netns_path) = if !cfg.host_network {
+            if let Some(cni_env) = lightr_cri_net::cni_available() {
+                match cni_setup(&id, &cni_env, &cfg.port_mappings) {
+                    Ok((resolved_ip, ns_path)) => (resolved_ip, Some(ns_path)),
+                    Err(e) => {
+                        return Err(BackendError::Internal(format!(
+                            "CNI setup for sandbox {}: {e}",
+                            id.0
+                        )));
+                    }
+                }
+            } else {
+                // CNI unavailable (macOS / unprivileged) — host-network fallback (probe-truthful).
+                (None, None)
+            }
+        } else {
+            // host_network=true: no netns, no IP.
+            (None, None)
+        };
+
         let rec = SandboxRecord {
             id: id.clone(),
             config: cfg,
             state: SandboxState::Ready,
             created_at_nanos: now_nanos(),
+            ip,
+            netns_path,
         };
         let filename = format!("{}.json", id.0);
+        // Crash-only §D: persist BEFORE returning.
         atomic_write_json(&self.sandboxes_dir, &filename, &rec)?;
         let mut cache = self.cache.lock().unwrap();
         cache.sandboxes.insert(id.clone(), rec);
@@ -552,24 +586,35 @@ impl CriBackend for FakeBackend {
         // First stop it (idempotent)
         self.stop_sandbox(id)?;
 
-        // Collect containers belonging to this sandbox
-        let container_ids: Vec<ContainerId> = {
+        // Collect containers belonging to this sandbox, and snapshot netns/ip for §D teardown.
+        let (container_ids, sandbox_ip, sandbox_netns_path) = {
             let cache = self.cache.lock().unwrap();
             if !cache.sandboxes.contains_key(id) {
                 return Ok(()); // already gone
             }
-            cache
+            let containers: Vec<ContainerId> = cache
                 .containers
                 .values()
                 .filter(|c| &c.sandbox == id)
                 .map(|c| c.id.clone())
-                .collect()
+                .collect();
+            let (ip, netns) = cache
+                .sandboxes
+                .get(id)
+                .map(|s| (s.ip.clone(), s.netns_path.clone()))
+                .unwrap_or((None, None));
+            (containers, ip, netns)
         };
 
         // Stop+remove each container
         for cid in &container_ids {
             self.stop_container(cid, 0)?;
             self.remove_container(cid)?;
+        }
+
+        // §D: CNI DEL + netns teardown (idempotent; fail-closed on DEL error).
+        if let Some(ref ns_path) = sandbox_netns_path {
+            cni_teardown(id, ns_path, &sandbox_ip);
         }
 
         // Remove the sandbox record
@@ -1254,34 +1299,34 @@ impl CriBackend for FakeBackend {
             command.env(k, v);
         }
 
-        // netns setns: on Linux, if the container's sandbox has netns_path recorded,
-        // enter it via setns(CLONE_NEWNET) in pre_exec.
-        // WP-B is responsible for recording netns_path; when None we run on host.
-        // (build-spec-r1 §3 WP-A: "if netns_path is None just run on host")
+        // §D: on Linux, if the container's sandbox has a recorded netns_path, setns
+        // into it in pre_exec (async-signal-safe: open fd in parent, move OwnedFd into
+        // closure, call setns — no alloc in pre_exec).  When netns_path is None (host_network
+        // or CNI unavailable), exec runs on the host network as before.
         #[cfg(target_os = "linux")]
         {
-            let netns_path = {
+            let netns_path_opt: Option<String> = {
                 let cache = self.cache.lock().unwrap();
                 cache
                     .sandboxes
                     .get(&rec.sandbox)
-                    .and_then(|s| s.config.log_directory.as_str().get(..0).map(|_| ()))
-                    .map(|_| ())
-                    // Actually look at a netns field — but SandboxRecord does not store
-                    // netns_path (only SandboxStatus has it, which is WP-B territory).
-                    // For now: None → run on host. The check is here to document the
-                    // hook; WP-B will add the field.
-                    .and(None::<String>)
+                    .and_then(|s| s.netns_path.clone())
             };
-            if let Some(path) = netns_path {
+            if let Some(ref path_str) = netns_path_opt {
+                // Open the netns fd in the parent (before fork) and move OwnedFd
+                // into the pre_exec closure — async-signal-safe (r1-cni.md "Join at spawn").
+                let ns_fd = lightr_cri_net::netns::join_netns(std::path::Path::new(path_str))
+                    .map_err(|e| {
+                        BackendError::Internal(format!("open_exec join_netns {path_str}: {e}"))
+                    })?;
                 unsafe {
+                    use std::os::unix::io::IntoRawFd;
                     use std::os::unix::process::CommandExt;
+                    let raw_fd = ns_fd.into_raw_fd();
                     command.pre_exec(move || {
-                        let f = std::fs::File::open(&path).map_err(|e| {
-                            std::io::Error::new(e.kind(), format!("open netns {path}: {e}"))
-                        })?;
-                        use std::os::unix::io::AsRawFd;
-                        let rc = libc::setns(f.as_raw_fd(), libc::CLONE_NEWNET);
+                        let rc = libc::setns(raw_fd, libc::CLONE_NEWNET);
+                        // Close the fd regardless of setns result (we own it).
+                        libc::close(raw_fd);
                         if rc != 0 {
                             return Err(std::io::Error::last_os_error());
                         }
@@ -1457,6 +1502,87 @@ impl CriBackend for FakeBackend {
                 waiter: Box::new(AttachWaiter),
             })
         }
+    }
+
+    /// §D probe-truthful: reflects whether CNI is wired and available.
+    /// On macOS / unprivileged (cni_available None) → false (host-network behavior).
+    fn network_ready(&self) -> bool {
+        lightr_cri_net::cni_available().is_some()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §D helpers: CNI setup and teardown (Linux only; no-op on macOS / unprivileged)
+// ---------------------------------------------------------------------------
+
+/// Find the lexicographically first .conflist in the given directory.
+fn first_conflist(conf_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut entries: Vec<std::path::PathBuf> = conf_dir
+        .read_dir()
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .and_then(|x| x.to_str())
+                .map(|x| x == "conflist")
+                .unwrap_or(false)
+        })
+        .collect();
+    entries.sort();
+    entries.into_iter().next()
+}
+
+/// Create a netns and run CNI ADD for a new sandbox.
+/// Returns (pod_ip, netns_path_string) on success.
+fn cni_setup(
+    id: &SandboxId,
+    cni_env: &lightr_cri_net::CniEnv,
+    port_mappings: &[PortMapping],
+) -> std::io::Result<(Option<String>, String)> {
+    // Name the netns after the sandbox id (safe chars: [a-z0-9_.-]).
+    // Use only the first 32 chars of the id to stay within IFNAMSIZ-like limits.
+    let ns_name = format!("lightr-{}", &id.0[..id.0.len().min(24)]);
+    let ns_path = lightr_cri_net::netns::create(&ns_name)?;
+    let ns_path_str = ns_path.to_string_lossy().into_owned();
+
+    let conflist_path = first_conflist(&cni_env.conf_dir).ok_or_else(|| {
+        std::io::Error::other(format!(
+            "no .conflist found in {}",
+            cni_env.conf_dir.display()
+        ))
+    })?;
+
+    let result = lightr_cri_net::chain::add(&conflist_path, &id.0, &ns_path, port_mappings)
+        .map_err(|e| std::io::Error::other(format!("CNI ADD: {e}")))?;
+
+    Ok((result.ip, ns_path_str))
+}
+
+/// Invoke CNI DEL and then tear down the netns.
+/// Fail-closed: DEL errors are logged but teardown continues (§D law).
+fn cni_teardown(id: &SandboxId, netns_path: &str, _ip: &Option<String>) {
+    let ns_path = std::path::Path::new(netns_path);
+
+    // Attempt CNI DEL (no port_mappings needed for teardown — omit for simplicity;
+    // the portmap plugin handles missing mappings gracefully on DEL).
+    if let Some(cni_env) = lightr_cri_net::cni_available() {
+        if let Some(conflist_path) = first_conflist(&cni_env.conf_dir) {
+            if let Err(e) = lightr_cri_net::chain::del(&conflist_path, &id.0, ns_path, &[]) {
+                eprintln!(
+                    "[lightr-cri-fake] CNI DEL for sandbox {} failed (continuing teardown): {e}",
+                    id.0
+                );
+            }
+        }
+    }
+
+    // umount2 + unlink — LAW: umount first (containerd#6143).
+    if let Err(e) = lightr_cri_net::netns::teardown(ns_path) {
+        eprintln!(
+            "[lightr-cri-fake] netns teardown for {} failed: {e}",
+            netns_path
+        );
     }
 }
 

@@ -674,6 +674,7 @@ dependencies = [
  "blake3",
  "libc",
  "lightr-cri-backend",
+ "lightr-cri-net",
  "nix",
  "serde",
  "serde_json",
