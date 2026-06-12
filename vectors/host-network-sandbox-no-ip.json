@@ -1,0 +1,17 @@
+{
+  "name": "host-network-sandbox-no-ip",
+  "steps": [
+    {
+      "op": "run_sandbox",
+      "cfg": {
+        "name": "s1",
+        "uid": "u1",
+        "namespace": "ns",
+        "attempt": 0,
+        "host_network": true
+      }
+    },
+    { "op": "sandbox_status_ip", "id": "$0", "expect_ip_present": false },
+    { "op": "remove_sandbox", "id": "$0" }
+  ]
+}

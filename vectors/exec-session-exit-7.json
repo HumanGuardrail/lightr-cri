@@ -1,0 +1,33 @@
+{
+  "name": "exec-session-exit-7",
+  "steps": [
+    {
+      "op": "run_sandbox",
+      "cfg": {
+        "name": "s1",
+        "uid": "u1",
+        "namespace": "ns",
+        "attempt": 0
+      }
+    },
+    {
+      "op": "create_container",
+      "sandbox": "$0",
+      "cfg": {
+        "name": "c1",
+        "attempt": 0,
+        "image_ref": "ref/sh",
+        "command": ["/bin/sleep", "60"]
+      }
+    },
+    { "op": "start_container", "id": "$1" },
+    {
+      "op": "open_exec",
+      "id": "$1",
+      "cmd": ["/bin/sh", "-c", "exit 7"],
+      "expect_exit_code": 7
+    },
+    { "op": "stop_container", "id": "$1", "grace_seconds": 0 },
+    { "op": "remove_sandbox", "id": "$0" }
+  ]
+}
