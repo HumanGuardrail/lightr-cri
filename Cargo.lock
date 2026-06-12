@@ -730,7 +730,6 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "flate2",
- "httparse",
  "hyper",
  "hyper-util",
  "lightr-cri-backend",

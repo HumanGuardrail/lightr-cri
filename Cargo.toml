@@ -35,4 +35,3 @@ tonic-build = "0.12"
 nix = { version = "0.29", features = ["sched", "mount", "process"] }
 axum = { version = "0.7" }
 flate2 = "1"
-httparse = "1"

@@ -23,7 +23,6 @@ axum = { workspace = true, features = ["ws"] }
 # member cannot override that without a cargo note), so both backends are
 # present — harmless, zlib-rs serves the dictionary path.
 flate2 = { workspace = true, features = ["zlib-rs"] }
-httparse = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # hyper/hyper-util: already in the lockfile via axum's "ws" feature. Named
