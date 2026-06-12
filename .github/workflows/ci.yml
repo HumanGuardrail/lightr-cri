@@ -9,6 +9,11 @@ jobs:
   # ── macOS: compile + unit lanes (no crictl/critest) ──────────────────────
   mac-compile:
     runs-on: [self-hosted, macos]
+    env:
+      # Build outside the runner _work dir: something on this host races
+      # files under _work mid-build (recurrent dep-info ENOENT with clean
+      # state, single listener, direct toolchain). Also: incremental builds.
+      CARGO_TARGET_DIR: /Users/gustavoschneiter/.lightr-ci-target
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
