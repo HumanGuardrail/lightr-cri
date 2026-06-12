@@ -426,11 +426,12 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
         request: Request<proto::StatusRequest>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
         let verbose = request.into_inner().verbose;
-        // NetworkReady: honest from backend.
-        // For the fake backend, sandboxes are host_network (no CNI required);
-        // report NetworkReady=true with an annotation explaining the model.
-        // A real CNI-capable backend should probe availability here (WP-B).
-        // ANNOTATE: fake backend uses host_network; CNI not required.
+        // Probe-truthful (contract §D): NetworkReady reflects the backend's
+        // REAL network readiness. host_network pods run regardless of this;
+        // only non-host-network pods are gated on it — so reporting the truth
+        // never blocks the hostNetwork smoke pod, and never lies to a
+        // non-host-network sync.
+        let net_ready = self.backend.network_ready();
         let conditions = vec![
             proto::RuntimeCondition {
                 r#type: "RuntimeReady".to_string(),
@@ -440,10 +441,17 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
             },
             proto::RuntimeCondition {
                 r#type: "NetworkReady".to_string(),
-                // fake: host_network sandboxes; no CNI probe needed (annotated).
-                status: true,
-                reason: String::new(),
-                message: "fake-host-network-no-cni".to_string(),
+                status: net_ready,
+                reason: if net_ready {
+                    String::new()
+                } else {
+                    "NetworkPluginNotReady".to_string()
+                },
+                message: if net_ready {
+                    String::new()
+                } else {
+                    "CNI not configured (host-network sandboxes only)".to_string()
+                },
             },
         ];
         // info is empty (verbose detail deferred to R2 structured status)

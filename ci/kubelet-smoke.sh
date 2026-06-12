@@ -204,10 +204,12 @@ fi
 # ListPodSandboxStats, GetContainerEvents, ListMetricDescriptors,
 # ListPodSandboxMetrics — all tolerated per kubelet source analysis).
 echo "--- kubelet-smoke: checking kubelet log for CRI-fatal lines ---"
-TOLERATED_RPCS="RuntimeConfig|ImageFsInfo|ListImages|ListContainerStats\
-|UpdateRuntimeConfig|ReopenContainerLog|PodSandboxStats|ListPodSandboxStats\
-|GetContainerEvents|ListMetricDescriptors|ListPodSandboxMetrics\
-|[Uu]nimplemented"
+# Anchored: each tolerated RPC ONLY when it appears with an unimplemented/
+# not-supported qualifier. A bare "unimplemented" token is NOT allowlisted, so
+# a genuine CRI fatal that merely contains the word cannot slip through
+# (cold-critic finding 2026-06-12).
+_RPC='RuntimeConfig|ImageFsInfo|ListImages|ListContainerStats|UpdateRuntimeConfig|ReopenContainerLog|PodSandboxStats|ListPodSandboxStats|GetContainerEvents|ListMetricDescriptors|ListPodSandboxMetrics'
+TOLERATED_RPCS="(${_RPC}).*([Uu]nimplemented|not.implemented|NotImplemented)|([Uu]nimplemented|not.implemented).*(${_RPC})"
 
 FATAL_LINES=$(grep -iE 'cri.*fatal|fatal.*cri|FATAL' "${LOG_DIR}/kubelet.log" \
   | grep -vE "${TOLERATED_RPCS}" \
