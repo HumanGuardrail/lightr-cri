@@ -1,4 +1,4 @@
-//! WP-4: conformance-vector runner (build-spec-r0 §6).
+//! WP-E: conformance-vector runner (build-spec-r0 §6, extended for v1.1).
 //!
 //! FROZEN laws:
 //! - Vector JSON shape per spec §6 (`$N` = result of step N;
@@ -7,7 +7,15 @@
 //! - Runs against `&dyn CriBackend` ONLY — never imports backend internals.
 //!   These vectors are the shared integration artifact with hugr-lightr.
 //! - A vector failure names the vector + step index + expected/actual.
+//!
+//! v1.1 additions (WP-E):
+//! - `open_exec` step: drives a StreamSession (write stdin if present, read
+//!   stdout to EOF, call waiter.wait() for exit code).
+//! - `assert_log_exists` / `assert_log_format`: read the CRI log file at
+//!   `sandbox.log_directory + "/" + container.log_path`; validate format.
+//! - `sandbox_status_ip`: check sandbox_status().ip against expect_ip_present.
 
+use std::io::Read as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -143,6 +151,118 @@ enum Step {
         expect_err: Option<String>,
     },
     ReopenBackend {},
+
+    // ── v1.1 steps ──────────────────────────────────────────────────────────
+    /// Open a streaming exec session on a running container.
+    /// Drives the StreamSession: writes nothing (stdin unsupported in vectors),
+    /// reads stdout to EOF, calls waiter.wait() for the exit code.
+    /// NOTE: requires WP-A's open_exec implementation. Vectors using this step
+    /// will fail pre-WP-A-merge with BackendError::Internal("v1.1 not
+    /// implemented") — that is expected. Parser/decode unit tests pass now.
+    OpenExec {
+        id: String,
+        cmd: Vec<String>,
+        #[serde(default)]
+        tty: bool,
+        #[serde(default)]
+        stdin: bool,
+        #[serde(default)]
+        expect_exit_code: Option<i32>,
+        #[serde(default)]
+        expect_stdout_contains: Option<String>,
+        #[serde(default)]
+        expect_err: Option<String>,
+    },
+
+    /// Assert that the CRI log file exists at
+    /// `sandbox.log_directory + "/" + container.log_path`.
+    /// Requires sandbox_id and container_id to look up the paths.
+    /// NOTE: requires WP-A's log-tee implementation.
+    AssertLogExists {
+        sandbox_id: String,
+        container_id: String,
+        #[serde(default)]
+        expect_err: Option<String>,
+    },
+
+    /// Assert that every line in the CRI log file matches the CRI log format:
+    /// `<RFC3339Nano> <stdout|stderr> <F|P> <data>`
+    /// NOTE: requires WP-A's log-tee implementation.
+    AssertLogFormat {
+        sandbox_id: String,
+        container_id: String,
+        #[serde(default)]
+        expect_err: Option<String>,
+    },
+
+    /// Assert sandbox_status().ip presence/absence.
+    /// `expect_ip_present: true` → ip must be Some(_).
+    /// `expect_ip_present: false` → ip must be None.
+    SandboxStatusIp {
+        id: String,
+        expect_ip_present: bool,
+        #[serde(default)]
+        expect_err: Option<String>,
+    },
+}
+
+// ── CRI log format validation ────────────────────────────────────────────────
+
+/// Validate a single CRI log line: `<RFC3339Nano> <stdout|stderr> <F|P> <data>`
+/// Returns Ok(()) if valid, Err(description) if not.
+/// Empty data ("") is allowed (F tag with no content).
+fn validate_cri_log_line(line: &str) -> Result<(), String> {
+    // Split into exactly 4 parts: timestamp stream tag data
+    // The data part may contain spaces, so split on the first 3 whitespace runs only.
+    let mut parts = line.splitn(4, char::is_whitespace);
+    let timestamp = parts.next().unwrap_or("");
+    let stream = parts.next().unwrap_or("");
+    let tag = parts.next().unwrap_or("");
+    // data (4th part) may be absent for empty lines — that's fine
+
+    // Validate timestamp: rough RFC3339 check — must contain 'T' and end with 'Z' or offset
+    if timestamp.is_empty() {
+        return Err(format!("missing timestamp in line: {:?}", line));
+    }
+    if !timestamp.contains('T') {
+        return Err(format!(
+            "timestamp {:?} does not look like RFC3339 (missing 'T')",
+            timestamp
+        ));
+    }
+    // Accept 'Z' suffix or numeric offset (+HH:MM / -HH:MM)
+    let ends_ok = timestamp.ends_with('Z')
+        || timestamp.ends_with('z')
+        || timestamp
+            .chars()
+            .rev()
+            .nth(5)
+            .map(|c| c == '+' || c == '-')
+            .unwrap_or(false)
+        || timestamp
+            .chars()
+            .rev()
+            .nth(2)
+            .map(|c| c == '+' || c == '-')
+            .unwrap_or(false);
+    if !ends_ok {
+        return Err(format!(
+            "timestamp {:?} does not end with 'Z' or UTC offset",
+            timestamp
+        ));
+    }
+
+    // Validate stream
+    if stream != "stdout" && stream != "stderr" {
+        return Err(format!("stream {:?} must be 'stdout' or 'stderr'", stream));
+    }
+
+    // Validate tag
+    if tag != "F" && tag != "P" {
+        return Err(format!("tag {:?} must be 'F' or 'P'", tag));
+    }
+
+    Ok(())
 }
 
 // ── $N substitution ──────────────────────────────────────────────────────────
@@ -579,6 +699,286 @@ fn execute_step(
             *backend = factory.reopen();
             StepOutcome::Ok(None)
         }
+
+        // ── v1.1 steps ───────────────────────────────────────────────────────
+        Step::OpenExec {
+            id,
+            cmd,
+            tty,
+            stdin,
+            expect_exit_code,
+            expect_stdout_contains,
+            expect_err,
+        } => {
+            let cid = ContainerId(subst(id, results));
+            let result = backend.open_exec(&cid, cmd, *tty, *stdin);
+            match result {
+                Err(e) => match expect_err {
+                    None => StepOutcome::Fail(format!("open_exec: unexpected error: {e}")),
+                    Some(expected) => {
+                        let actual = variant_name(&e);
+                        if actual == expected.as_str() {
+                            StepOutcome::Ok(None)
+                        } else {
+                            StepOutcome::Fail(format!(
+                                "open_exec: expected error '{expected}', got '{actual}': {e}"
+                            ))
+                        }
+                    }
+                },
+                Ok(mut session) => {
+                    if let Some(expected_err) = expect_err {
+                        return StepOutcome::Fail(format!(
+                            "open_exec: expected error '{expected_err}' but call succeeded"
+                        ));
+                    }
+                    // Drop stdin handle (we don't write to it in vectors)
+                    drop(session.stdin.take());
+
+                    // Read stdout to EOF
+                    let stdout_bytes = if let Some(mut stdout_file) = session.stdout.take() {
+                        let mut buf = Vec::new();
+                        if let Err(e) = stdout_file.read_to_end(&mut buf) {
+                            return StepOutcome::Fail(format!("open_exec: read stdout: {e}"));
+                        }
+                        buf
+                    } else {
+                        Vec::new()
+                    };
+
+                    // Drain stderr (ignore content)
+                    drop(session.stderr.take());
+                    drop(session.pty_master.take());
+
+                    // Wait for exit code
+                    let exit_code = match session.waiter.wait() {
+                        Ok(code) => code,
+                        Err(e) => {
+                            return StepOutcome::Fail(format!("open_exec: waiter.wait(): {e}"));
+                        }
+                    };
+
+                    if let Some(expected_code) = expect_exit_code {
+                        if exit_code != *expected_code {
+                            return StepOutcome::Fail(format!(
+                                "open_exec: expected exit_code {}, got {}",
+                                expected_code, exit_code
+                            ));
+                        }
+                    }
+
+                    if let Some(needle) = expect_stdout_contains {
+                        let stdout_str = String::from_utf8_lossy(&stdout_bytes);
+                        if !stdout_str.contains(needle.as_str()) {
+                            return StepOutcome::Fail(format!(
+                                "open_exec: stdout {:?} does not contain {:?}",
+                                stdout_str, needle
+                            ));
+                        }
+                    }
+
+                    StepOutcome::Ok(None)
+                }
+            }
+        }
+
+        Step::AssertLogExists {
+            sandbox_id,
+            container_id,
+            expect_err,
+        } => {
+            let sid = SandboxId(subst(sandbox_id, results));
+            let cid = ContainerId(subst(container_id, results));
+
+            // Look up sandbox to get log_directory
+            let sandbox_status = match backend.sandbox_status(&sid) {
+                Ok(s) => s,
+                Err(e) => {
+                    if let Some(expected) = expect_err {
+                        let actual = variant_name(&e);
+                        if actual == expected.as_str() {
+                            return StepOutcome::Ok(None);
+                        }
+                        return StepOutcome::Fail(format!(
+                            "assert_log_exists: sandbox_status error: expected '{expected}', got '{actual}': {e}"
+                        ));
+                    }
+                    return StepOutcome::Fail(format!(
+                        "assert_log_exists: sandbox_status error: {e}"
+                    ));
+                }
+            };
+
+            // Look up container to get log_path
+            let container_status = match backend.container_status(&cid) {
+                Ok(s) => s,
+                Err(e) => {
+                    if let Some(expected) = expect_err {
+                        let actual = variant_name(&e);
+                        if actual == expected.as_str() {
+                            return StepOutcome::Ok(None);
+                        }
+                        return StepOutcome::Fail(format!(
+                            "assert_log_exists: container_status error: expected '{expected}', got '{actual}': {e}"
+                        ));
+                    }
+                    return StepOutcome::Fail(format!(
+                        "assert_log_exists: container_status error: {e}"
+                    ));
+                }
+            };
+
+            if expect_err.is_some() {
+                return StepOutcome::Fail(
+                    "assert_log_exists: expected error but lookups succeeded".to_string(),
+                );
+            }
+
+            let log_dir = &sandbox_status.config.log_directory;
+            let log_path = &container_status.config.log_path;
+
+            if log_dir.is_empty() || log_path.is_empty() {
+                return StepOutcome::Fail(format!(
+                    "assert_log_exists: log_directory={:?} or log_path={:?} is empty",
+                    log_dir, log_path
+                ));
+            }
+
+            let full_path = std::path::Path::new(log_dir).join(log_path);
+            if !full_path.exists() {
+                return StepOutcome::Fail(format!(
+                    "assert_log_exists: log file {:?} does not exist",
+                    full_path
+                ));
+            }
+
+            StepOutcome::Ok(None)
+        }
+
+        Step::AssertLogFormat {
+            sandbox_id,
+            container_id,
+            expect_err,
+        } => {
+            let sid = SandboxId(subst(sandbox_id, results));
+            let cid = ContainerId(subst(container_id, results));
+
+            let sandbox_status = match backend.sandbox_status(&sid) {
+                Ok(s) => s,
+                Err(e) => {
+                    if let Some(expected) = expect_err {
+                        let actual = variant_name(&e);
+                        if actual == expected.as_str() {
+                            return StepOutcome::Ok(None);
+                        }
+                        return StepOutcome::Fail(format!(
+                            "assert_log_format: sandbox_status error: expected '{expected}', got '{actual}': {e}"
+                        ));
+                    }
+                    return StepOutcome::Fail(format!(
+                        "assert_log_format: sandbox_status error: {e}"
+                    ));
+                }
+            };
+
+            let container_status = match backend.container_status(&cid) {
+                Ok(s) => s,
+                Err(e) => {
+                    if let Some(expected) = expect_err {
+                        let actual = variant_name(&e);
+                        if actual == expected.as_str() {
+                            return StepOutcome::Ok(None);
+                        }
+                        return StepOutcome::Fail(format!(
+                            "assert_log_format: container_status error: expected '{expected}', got '{actual}': {e}"
+                        ));
+                    }
+                    return StepOutcome::Fail(format!(
+                        "assert_log_format: container_status error: {e}"
+                    ));
+                }
+            };
+
+            if expect_err.is_some() {
+                return StepOutcome::Fail(
+                    "assert_log_format: expected error but lookups succeeded".to_string(),
+                );
+            }
+
+            let log_dir = &sandbox_status.config.log_directory;
+            let log_path = &container_status.config.log_path;
+
+            if log_dir.is_empty() || log_path.is_empty() {
+                return StepOutcome::Fail(format!(
+                    "assert_log_format: log_directory={:?} or log_path={:?} is empty",
+                    log_dir, log_path
+                ));
+            }
+
+            let full_path = std::path::Path::new(log_dir).join(log_path);
+            let content = match std::fs::read_to_string(&full_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    return StepOutcome::Fail(format!(
+                        "assert_log_format: read {:?}: {e}",
+                        full_path
+                    ));
+                }
+            };
+
+            // Validate each non-empty line
+            for (line_no, line) in content.lines().enumerate() {
+                if line.is_empty() {
+                    continue;
+                }
+                if let Err(msg) = validate_cri_log_line(line) {
+                    return StepOutcome::Fail(format!(
+                        "assert_log_format: line {}: {msg}",
+                        line_no + 1
+                    ));
+                }
+            }
+
+            StepOutcome::Ok(None)
+        }
+
+        Step::SandboxStatusIp {
+            id,
+            expect_ip_present,
+            expect_err,
+        } => {
+            let sid = SandboxId(subst(id, results));
+            match backend.sandbox_status(&sid) {
+                Ok(status) => {
+                    if let Some(expected_err) = expect_err {
+                        return StepOutcome::Fail(format!(
+                            "sandbox_status_ip: expected error '{expected_err}' but call succeeded"
+                        ));
+                    }
+                    let ip_present = status.ip.is_some();
+                    if ip_present != *expect_ip_present {
+                        return StepOutcome::Fail(format!(
+                            "sandbox_status_ip: expected ip_present={}, got ip_present={} (ip={:?})",
+                            expect_ip_present, ip_present, status.ip
+                        ));
+                    }
+                    StepOutcome::Ok(None)
+                }
+                Err(e) => match expect_err {
+                    None => StepOutcome::Fail(format!("sandbox_status_ip: unexpected error: {e}")),
+                    Some(expected) => {
+                        let actual = variant_name(&e);
+                        if actual == expected.as_str() {
+                            StepOutcome::Ok(None)
+                        } else {
+                            StepOutcome::Fail(format!(
+                                "sandbox_status_ip: expected error '{expected}', got '{actual}': {e}"
+                            ))
+                        }
+                    }
+                },
+            }
+        }
     }
 }
 
@@ -746,6 +1146,154 @@ mod tests {
             }
             _ => panic!("wrong step variant"),
         }
+    }
+
+    // ── v1.1 parser unit tests ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_open_exec_step() {
+        let json = r#"{
+            "name": "t",
+            "steps": [
+                {
+                    "op": "open_exec",
+                    "id": "$1",
+                    "cmd": ["/bin/echo", "hi"],
+                    "expect_exit_code": 0,
+                    "expect_stdout_contains": "hi"
+                }
+            ]
+        }"#;
+        let v: Vector = serde_json::from_str(json).expect("parse");
+        match &v.steps[0] {
+            Step::OpenExec {
+                cmd,
+                expect_exit_code,
+                expect_stdout_contains,
+                tty,
+                stdin,
+                ..
+            } => {
+                assert_eq!(cmd, &["/bin/echo", "hi"]);
+                assert_eq!(*expect_exit_code, Some(0));
+                assert_eq!(expect_stdout_contains.as_deref(), Some("hi"));
+                assert!(!tty);
+                assert!(!stdin);
+            }
+            _ => panic!("wrong step variant"),
+        }
+    }
+
+    #[test]
+    fn parse_open_exec_with_tty() {
+        let json = r#"{
+            "name": "t",
+            "steps": [
+                {"op": "open_exec", "id": "$1", "cmd": ["/bin/sh"], "tty": true, "stdin": true}
+            ]
+        }"#;
+        let v: Vector = serde_json::from_str(json).expect("parse");
+        match &v.steps[0] {
+            Step::OpenExec { tty, stdin, .. } => {
+                assert!(*tty);
+                assert!(*stdin);
+            }
+            _ => panic!("wrong step variant"),
+        }
+    }
+
+    #[test]
+    fn parse_assert_log_exists_step() {
+        let json = r#"{
+            "name": "t",
+            "steps": [
+                {"op": "assert_log_exists", "sandbox_id": "$0", "container_id": "$1"}
+            ]
+        }"#;
+        let v: Vector = serde_json::from_str(json).expect("parse");
+        assert!(matches!(v.steps[0], Step::AssertLogExists { .. }));
+    }
+
+    #[test]
+    fn parse_assert_log_format_step() {
+        let json = r#"{
+            "name": "t",
+            "steps": [
+                {"op": "assert_log_format", "sandbox_id": "$0", "container_id": "$1"}
+            ]
+        }"#;
+        let v: Vector = serde_json::from_str(json).expect("parse");
+        assert!(matches!(v.steps[0], Step::AssertLogFormat { .. }));
+    }
+
+    #[test]
+    fn parse_sandbox_status_ip_step() {
+        let json = r#"{
+            "name": "t",
+            "steps": [
+                {"op": "sandbox_status_ip", "id": "$0", "expect_ip_present": false}
+            ]
+        }"#;
+        let v: Vector = serde_json::from_str(json).expect("parse");
+        match &v.steps[0] {
+            Step::SandboxStatusIp {
+                expect_ip_present, ..
+            } => {
+                assert!(!expect_ip_present);
+            }
+            _ => panic!("wrong step variant"),
+        }
+    }
+
+    // ── CRI log format validator unit tests ───────────────────────────────────
+
+    #[test]
+    fn cri_log_line_valid_full_stdout() {
+        // Full line, stdout
+        assert!(
+            validate_cri_log_line("2026-06-12T10:00:00.000000000Z stdout F hello world").is_ok()
+        );
+    }
+
+    #[test]
+    fn cri_log_line_valid_partial_stderr() {
+        // Partial line, stderr
+        assert!(
+            validate_cri_log_line("2026-06-12T10:00:00.123456789Z stderr P some partial data")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn cri_log_line_valid_with_offset() {
+        // UTC offset instead of Z
+        assert!(validate_cri_log_line("2026-06-12T10:00:00+00:00 stdout F data").is_ok());
+    }
+
+    #[test]
+    fn cri_log_line_invalid_stream() {
+        let err = validate_cri_log_line("2026-06-12T10:00:00.000Z stdin F data");
+        assert!(err.is_err(), "expected error for invalid stream");
+    }
+
+    #[test]
+    fn cri_log_line_invalid_tag() {
+        let err = validate_cri_log_line("2026-06-12T10:00:00.000Z stdout X data");
+        assert!(err.is_err(), "expected error for invalid tag");
+    }
+
+    #[test]
+    fn cri_log_line_missing_timestamp_t() {
+        let err = validate_cri_log_line("2026-06-12 10:00:00Z stdout F data");
+        assert!(err.is_err(), "expected error for missing T separator");
+    }
+
+    #[test]
+    fn cri_log_line_empty_is_skipped_by_validator_directly() {
+        // The validator itself is not called on empty lines (the executor skips
+        // them), but validate_cri_log_line("") should return an error.
+        let err = validate_cri_log_line("");
+        assert!(err.is_err(), "empty line should return error");
     }
 
     #[test]

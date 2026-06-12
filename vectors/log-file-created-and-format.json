@@ -1,0 +1,32 @@
+{
+  "name": "log-file-created-and-format",
+  "steps": [
+    {
+      "op": "run_sandbox",
+      "cfg": {
+        "name": "s1",
+        "uid": "u1",
+        "namespace": "ns",
+        "attempt": 0,
+        "log_directory": "/tmp/lightr-cri-log-test/sb1"
+      }
+    },
+    {
+      "op": "create_container",
+      "sandbox": "$0",
+      "cfg": {
+        "name": "c1",
+        "attempt": 0,
+        "image_ref": "ref/sh",
+        "command": ["/bin/sh", "-c", "echo hello"],
+        "log_path": "c1/0.log"
+      }
+    },
+    { "op": "start_container", "id": "$1" },
+    { "op": "wait_exited", "id": "$1", "timeout_seconds": 10 },
+    { "op": "assert_log_exists",  "sandbox_id": "$0", "container_id": "$1" },
+    { "op": "assert_log_format",  "sandbox_id": "$0", "container_id": "$1" },
+    { "op": "remove_container", "id": "$1" },
+    { "op": "remove_sandbox", "id": "$0" }
+  ]
+}
