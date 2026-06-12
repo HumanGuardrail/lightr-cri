@@ -14,7 +14,13 @@ RUNNER_VER="2.335.1"
 NAME="lightr-cri-runner-linux"
 
 docker rm -f "${NAME}" 2>/dev/null || true
+# R1 networking conformance needs netns/CNI inside the container:
+# SYS_ADMIN (unshare/setns/mount; also unlocks them in the default seccomp
+# profile), NET_ADMIN (veth/bridge/iptables), apparmor unconfined (Ubuntu
+# hosts deny mount under docker-default). --privileged is the documented
+# fallback if the cgroup//dev long tail bites (kind hard-codes it).
 docker run -d --name "${NAME}" --restart unless-stopped \
+  --cap-add SYS_ADMIN --cap-add NET_ADMIN --security-opt apparmor=unconfined \
   -e RUNNER_ALLOW_RUNASROOT=1 -e TOKEN="${TOKEN}" -e RUNNER_VER="${RUNNER_VER}" \
   rust:1.96-bookworm bash -c '
     set -e
