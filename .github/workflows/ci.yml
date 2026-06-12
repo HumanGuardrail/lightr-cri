@@ -109,6 +109,9 @@ jobs:
           rm -rf /tmp/protoc && unzip -oq /tmp/protoc.zip -d /tmp/protoc
           sudo mv /tmp/protoc/bin/protoc /usr/local/bin/protoc
           sudo chmod +x /usr/local/bin/protoc
+          # well-known types (google/protobuf/*.proto): the zip ships them in
+          # include/ and protoc looks for them in /usr/local/include
+          sudo cp -rf /tmp/protoc/include/google /usr/local/include/
           protoc --version
 
       - name: verify vendored proto sha256s against PROVENANCE.md
