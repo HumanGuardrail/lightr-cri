@@ -8,6 +8,8 @@ members = [
     "crates/lightr-cri-server",
     "crates/lightr-cri-vectors",
     "crates/lightr-cri-acceptance",
+    "crates/lightr-cri-net",
+    "crates/lightr-cri-stream",
     "tools/protogen",
 ]
 
@@ -30,3 +32,7 @@ blake3 = "1"
 tempfile = "3"
 assert_cmd = "2"
 tonic-build = "0.12"
+nix = "0.29"
+axum = { version = "0.7" }
+flate2 = "1"
+httparse = "1"

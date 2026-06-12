@@ -200,12 +200,11 @@ fn a3_instant_pull() {
     // "pull is resolve-only" — a byte-moving pull is 10s+. On shared-docker
     // (Docker-on-Mac hosts) crictl spawn + virtualization can exceed 1s
     // under load without violating the law.
-    let ceiling_secs =
-        if std::env::var("LIGHTR_BUDGET_CLASS").as_deref() == Ok("shared-docker") {
-            3
-        } else {
-            1
-        };
+    let ceiling_secs = if std::env::var("LIGHTR_BUDGET_CLASS").as_deref() == Ok("shared-docker") {
+        3
+    } else {
+        1
+    };
     assert!(
         elapsed < std::time::Duration::from_secs(ceiling_secs),
         "A3: pull took {elapsed:?} (must be <{ceiling_secs} s — lazy CAS law)",

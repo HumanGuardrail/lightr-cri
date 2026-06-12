@@ -193,8 +193,14 @@ mod tests {
     fn tagged_normalization() {
         assert_eq!(tagged("ref/a3-test-image"), "ref/a3-test-image:latest");
         assert_eq!(tagged("alpine:3.20"), "alpine:3.20");
-        assert_eq!(tagged("registry:5000/team/img"), "registry:5000/team/img:latest");
-        assert_eq!(tagged("registry:5000/team/img:v1"), "registry:5000/team/img:v1");
+        assert_eq!(
+            tagged("registry:5000/team/img"),
+            "registry:5000/team/img:latest"
+        );
+        assert_eq!(
+            tagged("registry:5000/team/img:v1"),
+            "registry:5000/team/img:v1"
+        );
     }
 
     #[test]
