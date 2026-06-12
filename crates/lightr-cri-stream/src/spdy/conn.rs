@@ -40,11 +40,25 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
         self.out.flush().await
     }
 
-    /// SYN_REPLY with an (empty) compressed header block — acknowledges a
-    /// stream the client opened.
+    /// SYN_REPLY acknowledging a stream the client opened.
+    ///
+    /// The reply carries a header block with zero name/value pairs — k8s exec
+    /// streams attach no reply headers — but it MUST still be a *well-formed*
+    /// zlib-compressed SPDY header block, not literally empty: an empty
+    /// `header_block` would leave the client's inflate stream un-advanced and
+    /// desynchronize every subsequent block. `serialize_headers(&[])` emits the
+    /// valid 4-byte count=0 block (`00 00 00 00`); the connection-scoped
+    /// compressor turns it into a proper Z_SYNC_FLUSH-terminated zlib segment
+    /// the client decodes against the SPDY dictionary. (The compressed bytes
+    /// are non-empty even for a zero-pair block.)
     async fn syn_reply(&mut self, stream_id: u32) -> std::io::Result<()> {
         let block = headers::serialize_headers(&[]);
+        debug_assert_eq!(block, [0, 0, 0, 0], "empty header block is count=0");
         let compressed = self.comp.compress(&block);
+        debug_assert!(
+            !compressed.is_empty(),
+            "compressed SYN_REPLY header block must be a non-empty zlib segment"
+        );
         self.write_frame(&Frame::SynReply {
             stream_id,
             flags: 0,
@@ -227,6 +241,16 @@ pub async fn run_exec<S>(
         }
     }
 
+    // Drain stdout/stderr to EOF BEFORE the terminal Status. The output pumps
+    // run until their file hits EOF (the process closed its end); client-go
+    // expects every stdout/stderr byte to precede the v4 Status on the error
+    // stream. Awaiting (not aborting) the pumps is what actually delivers the
+    // output — aborting here truncates/drops it on a fast-exiting process, the
+    // wire-break where the session is unit-green but pumps nothing.
+    for t in output_tasks {
+        let _ = t.await;
+    }
+
     // Reap the process and emit the v4 Status on the error stream.
     if let Some(waiter) = waiter {
         let exit = tokio::task::spawn_blocking(move || waiter.wait())
@@ -238,9 +262,6 @@ pub async fn run_exec<S>(
             let mut w = writer.lock().await;
             let _ = w.data(err_id, frame::FLAG_FIN, json).await;
         }
-    }
-    for t in output_tasks {
-        t.abort();
     }
 }
 
