@@ -1,7 +1,8 @@
-//! lightr-cri-net — CNI invocation + netns lifecycle (WP-B skeleton).
+//! lightr-cri-net — CNI invocation + netns lifecycle (WP-B).
 //!
 //! FROZEN laws (build-spec-r1 §3 WP-B):
-//! - netns create/teardown per containerd pattern (bind-mount pin; umount2-then-unlink LAW; orphan sweep helper)
+//! - netns create/teardown per containerd pattern (bind-mount pin; umount2-then-unlink LAW;
+//!   orphan sweep helper)
 //! - CNI chain invocation per research brief (env+stdin contract, forward ADD/reverse DEL,
 //!   runtimeConfig.portMappings, prevResult threading, error JSON surfaced as
 //!   BackendError::Internal with plugin msg)
@@ -10,74 +11,68 @@
 //! - Unit-testable parts (conflist derivation, result parsing) MUST be host-testable without privileges
 //! - FIREWALL: no tonic/tokio
 
+pub mod chain;
+pub mod netns;
+
+/// Resolved CNI configuration used by `chain::add` / `chain::del`.
 pub struct CniEnv {
+    /// Directory containing the chosen conflist file.
     pub conf_dir: std::path::PathBuf,
+    /// Directory containing CNI plugin binaries.
     pub bin_dir: std::path::PathBuf,
 }
 
+/// Probe whether CNI is available and the process has the required privileges.
+///
+/// Returns `None` on macOS, when running unprivileged (EPERM on unshare), or when
+/// no conflist / binary directory is found.  Probe-truthful: never fakes an answer.
 pub fn cni_available() -> Option<CniEnv> {
-    todo!("WP-B")
-}
+    // macOS short-circuit — no kernel namespaces.
+    #[cfg(target_os = "macos")]
+    return None;
 
-pub mod netns {
-    /// Create a new named network namespace, bind-mount it, and return its path.
-    pub fn create(_name: &str) -> std::io::Result<std::path::PathBuf> {
-        todo!("WP-B")
-    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        use std::path::PathBuf;
 
-    /// Unmount and unlink a pinned netns (umount2-then-unlink LAW).
-    pub fn teardown(_path: &std::path::Path) -> std::io::Result<()> {
-        todo!("WP-B")
-    }
+        // Resolve directories from env overrides or defaults.
+        let conf_dir = std::env::var("LIGHTR_CNI_CONF")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/etc/cni/net.d"));
+        let bin_dir = std::env::var("LIGHTR_CNI_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/opt/cni/bin"));
 
-    /// Sweep orphaned netns entries under `dir`, returning the count removed.
-    pub fn sweep(_dir: &std::path::Path) -> std::io::Result<usize> {
-        todo!("WP-B")
-    }
-}
-
-pub mod chain {
-    use lightr_cri_backend::PortMapping;
-
-    /// Minimal CNI result returned from a successful ADD.
-    pub struct CniResult {
-        pub ip: Option<String>,
-    }
-
-    /// CNI invocation error (plugin stderr / error JSON message).
-    pub struct CniError(pub String);
-
-    impl std::fmt::Debug for CniError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "CniError({})", self.0)
+        // Require at least one .conflist file in conf_dir.
+        let has_conflist = conf_dir.read_dir().ok()?.filter_map(|e| e.ok()).any(|e| {
+            e.path()
+                .extension()
+                .and_then(|x| x.to_str())
+                .map(|x| x == "conflist")
+                .unwrap_or(false)
+        });
+        if !has_conflist {
+            return None;
         }
-    }
 
-    impl std::fmt::Display for CniError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "{}", self.0)
+        // Require bin_dir to exist and have at least one file (rough check).
+        if !bin_dir.is_dir() {
+            return None;
         }
-    }
 
-    impl std::error::Error for CniError {}
+        // Privilege probe: attempt unshare(CLONE_NEWNET) on a throwaway thread.
+        // EPERM → not privileged → None.
+        let priv_ok = std::thread::spawn(|| -> bool {
+            use nix::sched::{unshare, CloneFlags};
+            unshare(CloneFlags::CLONE_NEWNET).is_ok()
+        })
+        .join()
+        .unwrap_or(false);
 
-    /// Invoke the CNI ADD command for the given conflist.
-    pub fn add(
-        _conflist_path: &std::path::Path,
-        _container_id: &str,
-        _netns_path: &std::path::Path,
-        _port_mappings: &[PortMapping],
-    ) -> Result<CniResult, CniError> {
-        todo!("WP-B")
-    }
+        if !priv_ok {
+            return None;
+        }
 
-    /// Invoke the CNI DEL command for the given conflist.
-    pub fn del(
-        _conflist_path: &std::path::Path,
-        _container_id: &str,
-        _netns_path: &std::path::Path,
-        _port_mappings: &[PortMapping],
-    ) -> Result<(), CniError> {
-        todo!("WP-B")
+        Some(CniEnv { conf_dir, bin_dir })
     }
 }

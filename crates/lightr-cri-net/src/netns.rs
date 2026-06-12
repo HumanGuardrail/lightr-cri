@@ -1,0 +1,164 @@
+//! Network namespace lifecycle — containerd bind-mount pattern.
+//!
+//! Laws (r1-cni.md "Netns lifecycle"):
+//! - Create: mkdir /run/netns, touch the file, on a DEDICATED std::thread:
+//!   unshare(CLONE_NEWNET) then bind-mount /proc/self/task/<gettid>/ns/net → path;
+//!   thread exits, mount pins the ns.
+//! - Teardown LAW: umount2(path, MNT_DETACH) THEN unlink (never skip — containerd#6143).
+//! - Sweep: for each entry under dir, if no process holds it, umount+unlink.
+//! - join_netns: open the file O_RDONLY, return OwnedFd (caller passes into pre_exec).
+
+use std::fs;
+use std::io;
+use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
+use std::path::{Path, PathBuf};
+
+const NETNS_DIR: &str = "/run/netns";
+
+/// Create a new named network namespace pinned at `/run/netns/<name>`.
+///
+/// Returns the path on success.  The operation runs on a dedicated OS thread
+/// so that `unshare(CLONE_NEWNET)` only affects that thread and not the caller.
+pub fn create(name: &str) -> io::Result<PathBuf> {
+    let dir = Path::new(NETNS_DIR);
+    fs::create_dir_all(dir)?;
+
+    let path = dir.join(name);
+    // Touch the file so it exists as a mount point.
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+
+    let path_clone = path.clone();
+    let result = std::thread::spawn(move || -> io::Result<()> { create_on_thread(&path_clone) })
+        .join()
+        .map_err(|_| io::Error::other("netns create thread panicked"))?;
+
+    result?;
+    Ok(path)
+}
+
+/// Performed on the dedicated thread: unshare, then bind-mount the thread-local netns.
+#[cfg(target_os = "linux")]
+fn create_on_thread(path: &Path) -> io::Result<()> {
+    use nix::mount::{mount, MsFlags};
+    use nix::sched::{unshare, CloneFlags};
+    use nix::unistd::gettid;
+
+    // Create a new network namespace for THIS thread only.
+    unshare(CloneFlags::CLONE_NEWNET)
+        .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
+
+    // Bind-mount the thread-local ns file onto the pinned path.
+    let tid = gettid();
+    let ns_src = format!("/proc/self/task/{}/ns/net", tid);
+
+    mount(
+        Some(ns_src.as_str()),
+        path,
+        None::<&str>,
+        MsFlags::MS_BIND,
+        None::<&str>,
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("bind-mount netns: {e}")))?;
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn create_on_thread(_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "netns create is Linux-only",
+    ))
+}
+
+/// Tear down a pinned netns: `umount2(path, MNT_DETACH)` then `unlink`.
+///
+/// LAW: umount first, unlink second.  Reversing the order causes EBUSY on the
+/// mount point and leaves the kernel ns referenced indefinitely (containerd#6143).
+pub fn teardown(path: &Path) -> io::Result<()> {
+    umount_detach(path)?;
+    fs::remove_file(path)
+}
+
+#[cfg(target_os = "linux")]
+fn umount_detach(path: &Path) -> io::Result<()> {
+    use nix::mount::{umount2, MntFlags};
+    umount2(path, MntFlags::MNT_DETACH)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("umount2: {e}")))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn umount_detach(_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "umount2 is Linux-only",
+    ))
+}
+
+/// Sweep `dir` for orphaned netns files (no process holds an open fd to them)
+/// and clean each one up.  Returns the number of entries removed.
+///
+/// Heuristic (matches containerd): try `umount2(MNT_DETACH)`; EINVAL → stale
+/// touch file (never mounted) → just unlink; EBUSY or any other error → skip
+/// (another process may still hold it).
+pub fn sweep(dir: &Path) -> io::Result<usize> {
+    let mut removed = 0usize;
+    for entry in fs::read_dir(dir)? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if matches!(sweep_one(&path), Ok(true)) {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+#[cfg(target_os = "linux")]
+fn sweep_one(path: &Path) -> io::Result<bool> {
+    use nix::errno::Errno;
+    use nix::mount::{umount2, MntFlags};
+
+    match umount2(path, MntFlags::MNT_DETACH) {
+        Ok(()) => {
+            fs::remove_file(path)?;
+            Ok(true)
+        }
+        Err(Errno::EINVAL) => {
+            // Not mounted — stale file; just remove.
+            fs::remove_file(path)?;
+            Ok(true)
+        }
+        Err(_) => {
+            // EBUSY or other — still in use; leave it.
+            Ok(false)
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sweep_one(_path: &Path) -> io::Result<bool> {
+    Ok(false)
+}
+
+/// Open a pinned netns file `O_RDONLY` for use in a `pre_exec` setns call.
+///
+/// The returned `OwnedFd` should be moved into the closure passed to
+/// `Command::pre_exec`; the `setns(fd, CLONE_NEWNET)` call is async-signal-safe
+/// and allocates nothing.
+pub fn join_netns(path: &Path) -> io::Result<OwnedFd> {
+    let file = fs::OpenOptions::new().read(true).open(path)?;
+    let raw = file.into_raw_fd();
+    // SAFETY: `file` is open and valid; we consume it via into_raw_fd so
+    // the OwnedFd is the sole owner.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
