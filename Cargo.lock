@@ -609,6 +609,7 @@ dependencies = [
  "blake3",
  "libc",
  "lightr-cri-backend",
+ "nix",
  "serde",
  "serde_json",
  "tempfile",

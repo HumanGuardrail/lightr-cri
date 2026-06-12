@@ -16,6 +16,10 @@
 //!   unparseable refs with InvalidArgument.
 //! - Stats: real /proc/<pid>-based on Linux; zeroed-with-timestamp elsewhere
 //!   (probe-truthful).
+//! - v1.1 (WP-A): start_container TEEs stdout/stderr to CRI log file at
+//!   `sandbox.log_directory + "/" + container.log_path` (§C format);
+//!   open_exec spawns cmd in container context (pipes or pty); open_attach
+//!   returns held stdio handles from a side-table.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -58,6 +62,27 @@ struct ImageDiskRecord {
     pub id: String,
     pub ref_name: String,
     pub size: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Stdio handle side-table (not persisted — fake limitation: attach unavailable
+// after restart; see open_attach implementation comment).
+// ---------------------------------------------------------------------------
+
+/// Held stdio for a running container. The tty case keeps one pty master fd
+/// (cloned for each attach call). The pipe case holds the read-end of stdout
+/// and stderr, plus write-end of stdin (None if container.stdin=false).
+///
+/// NOT serialized. These fds are valid only in the current process.
+struct ContainerIo {
+    /// If the container was started with tty=true, the pty master fd.
+    pty_master: Option<std::fs::File>,
+    /// Pipe-mode: read end of the process stdout pipe.
+    stdout_rd: Option<std::fs::File>,
+    /// Pipe-mode: read end of the process stderr pipe.
+    stderr_rd: Option<std::fs::File>,
+    /// Write end of the process stdin pipe (if config.stdin=true).
+    stdin_wr: Option<std::fs::File>,
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +155,10 @@ pub struct FakeBackend {
     containers_dir: PathBuf,
     images_dir: PathBuf,
     cache: Arc<Mutex<Cache>>,
+    /// Side-table: held stdio for containers spawned in this process.
+    /// Keyed by ContainerId; entries removed when the container exits.
+    /// NOT behind the same Mutex as the cache to avoid lock ordering issues.
+    io_table: Arc<Mutex<BTreeMap<ContainerId, ContainerIo>>>,
 }
 
 impl FakeBackend {
@@ -219,6 +248,7 @@ impl FakeBackend {
             containers_dir,
             images_dir,
             cache: Arc::new(Mutex::new(cache)),
+            io_table: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 }
@@ -345,6 +375,137 @@ fn sandbox_rec_to_status(rec: &SandboxRecord) -> SandboxStatus {
         created_at_nanos: rec.created_at_nanos,
         ip: None,         // WP-D wires these (build-spec-r1 §3)
         netns_path: None, // WP-D wires these (build-spec-r1 §3)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CRI log tee helpers (§C)
+// ---------------------------------------------------------------------------
+
+/// Format one CRI log line: `<RFC3339Nano> <stdout|stderr> <F|P> <data>\n`
+/// F = full line (data ends with '\n'); P = partial (no trailing newline).
+fn cri_log_line(stream: &str, data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let ts = {
+        // RFC3339 with nanosecond precision
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
+        let secs = now.as_secs();
+        let nanos = now.subsec_nanos();
+        // Compute UTC datetime from epoch seconds
+        let (y, mo, d, h, mi, s) = epoch_to_ymd_hms(secs);
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:09}Z",
+            y, mo, d, h, mi, s, nanos
+        )
+    };
+    let tag = if data.ends_with(b"\n") { "F" } else { "P" };
+    let mut out = Vec::with_capacity(ts.len() + 3 + stream.len() + 1 + data.len() + 1);
+    write!(out, "{} {} {} ", ts, stream, tag).unwrap();
+    out.extend_from_slice(data);
+    if !data.ends_with(b"\n") {
+        out.push(b'\n');
+    }
+    out
+}
+
+/// Minimal UTC decomposition from Unix epoch (no external dep).
+fn epoch_to_ymd_hms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let days = secs / 86400;
+    // Shift to 1 March 2000 epoch for easier leap-year math (Rata Die variant)
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z % 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    (y as u32, mo as u32, d as u32, h as u32, m as u32, s as u32)
+}
+
+/// Open (create-or-append) the CRI log file at `log_dir/log_path`.
+/// Creates parent dirs. Creates an empty file if it doesn't exist yet.
+fn open_cri_log(log_dir: &str, log_path: &str) -> std::io::Result<Option<fs::File>> {
+    if log_dir.is_empty() || log_path.is_empty() {
+        return Ok(None);
+    }
+    let path = PathBuf::from(log_dir).join(log_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    Ok(Some(f))
+}
+
+/// Spawn a tee thread that reads from `reader` and writes CRI-formatted lines
+/// to the log file. The log file handle is Arc<Mutex<>> so multiple streams
+/// can interleave safely.
+fn spawn_tee_thread(
+    stream_name: &'static str,
+    reader: std::fs::File,
+    log: Arc<Mutex<Option<fs::File>>>,
+) {
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+        let br = BufReader::new(reader);
+        for line in br.split(b'\n') {
+            match line {
+                Ok(mut data) => {
+                    // split() strips the delimiter — re-add newline for F tag
+                    data.push(b'\n');
+                    let formatted = cri_log_line(stream_name, &data);
+                    let mut lg = log.lock().unwrap();
+                    if let Some(f) = lg.as_mut() {
+                        use std::io::Write;
+                        let _ = f.write_all(&formatted);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// pty helpers
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+fn dup_file(f: &std::fs::File) -> std::io::Result<std::fs::File> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let fd = unsafe { libc::dup(f.as_raw_fd()) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+// ---------------------------------------------------------------------------
+// ExitWaiter implementations
+// ---------------------------------------------------------------------------
+
+/// Waiter for a child spawned via std::process::Child.
+struct ChildWaiter {
+    child: std::process::Child,
+}
+
+impl ExitWaiter for ChildWaiter {
+    fn wait(mut self: Box<Self>) -> Result<i32> {
+        let status = self
+            .child
+            .wait()
+            .map_err(|e| BackendError::Internal(format!("wait: {e}")))?;
+        Ok(exit_code_from_status(&status))
     }
 }
 
@@ -497,6 +658,21 @@ impl CriBackend for FakeBackend {
             )));
         }
 
+        // Fetch the sandbox record to get log_directory
+        let sandbox_log_dir = {
+            let cache = self.cache.lock().unwrap();
+            cache
+                .sandboxes
+                .get(&rec.sandbox)
+                .map(|s| s.config.log_directory.clone())
+                .unwrap_or_default()
+        };
+
+        // Open (or create) the CRI log file — empty file must exist from start (kubelet law §C)
+        let log_file_opt =
+            open_cri_log(&sandbox_log_dir, &rec.config.log_path).map_err(BackendError::Io)?;
+        let log_shared: Arc<Mutex<Option<fs::File>>> = Arc::new(Mutex::new(log_file_opt));
+
         // Build command
         let mut cmd_iter = rec.config.command.iter().chain(rec.config.args.iter());
         let program = cmd_iter
@@ -512,22 +688,71 @@ impl CriBackend for FakeBackend {
             cmd.env(k, v);
         }
 
-        // setsid so the child survives parent's death
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
+        // ── Set up stdio ─────────────────────────────────────────────────────
+
+        // Decide on pty vs. pipe mode based on config.tty
+        let use_tty = rec.config.tty;
+
+        // tty=false: delegate to pipe-mode helper and return early
+        if !use_tty {
+            use std::process::Stdio;
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
+            if rec.config.stdin {
+                cmd.stdin(Stdio::piped());
+            } else {
+                cmd.stdin(Stdio::null());
+            }
+            #[cfg(unix)]
             unsafe {
+                use std::os::unix::process::CommandExt;
                 cmd.pre_exec(|| {
                     libc::setsid();
                     Ok(())
                 });
             }
+            return self.start_container_pipe_mode(id, rec, cmd, sandbox_log_dir, log_shared);
         }
 
-        // Crash-only law (cold-critic fix 2026-06-11): persist the START
-        // INTENT before spawning. If we die between spawn and the pid write,
-        // reopen sees Running+pid=0 → Exited/-1 "lost-start-window" instead
-        // of a phantom Created that could double-start.
+        // tty=true: open a pty pair, connect child to slave
+        use nix::pty::openpty;
+        let pty =
+            openpty(None, None).map_err(|e| BackendError::Internal(format!("openpty: {e}")))?;
+
+        // OwnedFd → std::fs::File (both implement the From conversion)
+        let master_file: std::fs::File = pty.master.into();
+        let slave_file: std::fs::File = pty.slave.into();
+
+        // Clone slave for stdin/stdout/stderr of child
+        let slave_stdin = dup_file(&slave_file).map_err(BackendError::Io)?;
+        let slave_stdout = dup_file(&slave_file).map_err(BackendError::Io)?;
+        let slave_stderr = slave_file; // last use — move it
+
+        use std::os::unix::process::CommandExt;
+        cmd.stdin(slave_stdin);
+        cmd.stdout(slave_stdout);
+        cmd.stderr(slave_stderr);
+
+        // setsid so the child can be a session leader (required for pty control)
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+
+        // Tee: master fd carries all output (stdout+stderr merged on pty)
+        let master_for_tee = dup_file(&master_file).map_err(BackendError::Io)?;
+        spawn_tee_thread("stdout", master_for_tee, Arc::clone(&log_shared));
+
+        let container_io = ContainerIo {
+            pty_master: Some(master_file),
+            stdout_rd: None,
+            stderr_rd: None,
+            stdin_wr: None,
+        };
+
+        // ── Persist start intent (crash-only) ────────────────────────────────
         let started_at = now_nanos();
         {
             let mut cache = self.cache.lock().unwrap();
@@ -548,7 +773,6 @@ impl CriBackend for FakeBackend {
         let child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                // Spawn failed: persist the truth (Exited) before erroring.
                 let mut cache = self.cache.lock().unwrap();
                 if let Some(entry) = cache.containers.get_mut(id) {
                     entry.state = ContainerState::Exited;
@@ -570,7 +794,13 @@ impl CriBackend for FakeBackend {
 
         let child_pid = child.id();
 
-        // Persist the real pid (intent → running)
+        // Store the io_table entry
+        {
+            let mut io = self.io_table.lock().unwrap();
+            io.insert(id.clone(), container_io);
+        }
+
+        // Persist real pid
         {
             let mut cache = self.cache.lock().unwrap();
             let entry = cache
@@ -589,9 +819,9 @@ impl CriBackend for FakeBackend {
         let containers_dir = self.containers_dir.clone();
         let cid = id.clone();
         let cache_arc = Arc::clone(&self.cache);
+        let io_table_arc = Arc::clone(&self.io_table);
 
         std::thread::spawn(move || {
-            // Wait for child to exit
             let mut child = child;
             let status = child.wait();
             let finished_at = now_nanos();
@@ -615,6 +845,9 @@ impl CriBackend for FakeBackend {
                 Err(e) => (-1, format!("wait-error: {e}")),
             };
 
+            // Remove io_table entry — fds are dropped here
+            io_table_arc.lock().unwrap().remove(&cid);
+
             let mut cache = cache_arc.lock().unwrap();
             if let Some(entry) = cache.containers.get_mut(&cid) {
                 if entry.state == ContainerState::Running {
@@ -622,15 +855,9 @@ impl CriBackend for FakeBackend {
                     entry.exit_code = exit_code;
                     entry.finished_at_nanos = finished_at;
                     entry.reason = reason;
-                    // Persist to disk BEFORE releasing the lock so that
-                    // reopen_backend (crash-recovery vectors) always sees the
-                    // final exit code. Without this, a race between the lock
-                    // release and the disk write means a concurrent reopen can
-                    // read the old Running record and set exit_code = -1.
                     let rec_clone = entry.clone();
                     let filename = format!("{}.json", cid.0);
                     let _ = atomic_write_json(&containers_dir, &filename, &rec_clone);
-                    // drop(cache) implicit at scope end
                 }
             }
         });
@@ -705,6 +932,8 @@ impl CriBackend for FakeBackend {
             let mut cache = self.cache.lock().unwrap();
             cache.containers.remove(id);
         }
+        // Clean up io_table entry if present
+        self.io_table.lock().unwrap().remove(id);
         let filename = format!("{}.json", id.0);
         let path = self.containers_dir.join(&filename);
         let _ = fs::remove_file(path);
@@ -972,6 +1201,438 @@ impl CriBackend for FakeBackend {
             used_bytes,
             inodes_used,
         })
+    }
+
+    // ---- v1.1 streaming methods ----
+
+    /// Open an exec session: spawn `cmd` in the container's execution context
+    /// (cwd, env; netns setns on Linux if netns_path is recorded — WP-B wires
+    /// this; fake: run on host when netns_path is None).
+    ///
+    /// tty=true → openpty: child's stdio = slave, StreamSession.stdout = pty
+    /// master clone, StreamSession.pty_master = pty master clone; stderr=None.
+    /// tty=false → pipe pairs: stdout/stderr/stdin Files.
+    /// stdin=false → no stdin pipe.
+    ///
+    /// The returned ExitWaiter waits the child and returns 128+sig or code.
+    fn open_exec(
+        &self,
+        id: &ContainerId,
+        cmd: &[String],
+        tty: bool,
+        stdin: bool,
+    ) -> Result<StreamSession> {
+        let rec = {
+            let cache = self.cache.lock().unwrap();
+            cache
+                .containers
+                .get(id)
+                .cloned()
+                .ok_or_else(|| BackendError::NotFound(format!("container {}", id.0)))?
+        };
+
+        if rec.state != ContainerState::Running {
+            return Err(BackendError::FailedPrecondition(format!(
+                "container {} is not Running (state={:?}); open_exec requires Running",
+                id.0, rec.state
+            )));
+        }
+
+        if cmd.is_empty() {
+            return Err(BackendError::InvalidArgument(
+                "open_exec: empty command".to_string(),
+            ));
+        }
+
+        let program = &cmd[0];
+        let mut command = std::process::Command::new(program);
+        command.args(&cmd[1..]);
+        if !rec.config.working_dir.is_empty() {
+            command.current_dir(&rec.config.working_dir);
+        }
+        for (k, v) in &rec.config.envs {
+            command.env(k, v);
+        }
+
+        // netns setns: on Linux, if the container's sandbox has netns_path recorded,
+        // enter it via setns(CLONE_NEWNET) in pre_exec.
+        // WP-B is responsible for recording netns_path; when None we run on host.
+        // (build-spec-r1 §3 WP-A: "if netns_path is None just run on host")
+        #[cfg(target_os = "linux")]
+        {
+            let netns_path = {
+                let cache = self.cache.lock().unwrap();
+                cache
+                    .sandboxes
+                    .get(&rec.sandbox)
+                    .and_then(|s| s.config.log_directory.as_str().get(..0).map(|_| ()))
+                    .map(|_| ())
+                    // Actually look at a netns field — but SandboxRecord does not store
+                    // netns_path (only SandboxStatus has it, which is WP-B territory).
+                    // For now: None → run on host. The check is here to document the
+                    // hook; WP-B will add the field.
+                    .and(None::<String>)
+            };
+            if let Some(path) = netns_path {
+                unsafe {
+                    use std::os::unix::process::CommandExt;
+                    command.pre_exec(move || {
+                        let f = std::fs::File::open(&path).map_err(|e| {
+                            std::io::Error::new(e.kind(), format!("open netns {path}: {e}"))
+                        })?;
+                        use std::os::unix::io::AsRawFd;
+                        let rc = libc::setns(f.as_raw_fd(), libc::CLONE_NEWNET);
+                        if rc != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+        }
+
+        if tty {
+            use nix::pty::openpty;
+            let pty =
+                openpty(None, None).map_err(|e| BackendError::Internal(format!("openpty: {e}")))?;
+
+            // OwnedFd → std::fs::File
+            let master_file: std::fs::File = pty.master.into();
+            let slave_file: std::fs::File = pty.slave.into();
+
+            let slave_stdin = dup_file(&slave_file).map_err(BackendError::Io)?;
+            let slave_stdout = dup_file(&slave_file).map_err(BackendError::Io)?;
+            let slave_stderr = slave_file;
+
+            use std::os::unix::process::CommandExt;
+            command.stdin(slave_stdin);
+            command.stdout(slave_stdout);
+            command.stderr(slave_stderr);
+
+            unsafe {
+                command.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+
+            let child = command
+                .spawn()
+                .map_err(|e| BackendError::Internal(format!("open_exec spawn: {e}")))?;
+
+            // stdout carries the pty stream; pty_master enables TIOCSWINSZ resize
+            let stdout_fd = dup_file(&master_file).map_err(BackendError::Io)?;
+
+            Ok(StreamSession {
+                stdin: None, // tty: no separate stdin (write to master)
+                stdout: Some(stdout_fd),
+                stderr: None,
+                pty_master: Some(master_file),
+                waiter: Box::new(ChildWaiter { child }),
+            })
+        } else {
+            use std::process::Stdio;
+            command.stdout(Stdio::piped());
+            command.stderr(Stdio::piped());
+            if stdin {
+                command.stdin(Stdio::piped());
+            } else {
+                command.stdin(Stdio::null());
+            }
+
+            let mut child = command
+                .spawn()
+                .map_err(|e| BackendError::Internal(format!("open_exec spawn: {e}")))?;
+
+            use std::os::unix::io::FromRawFd;
+
+            let stdout = child.stdout.take().map(|s| {
+                use std::os::unix::io::IntoRawFd;
+                unsafe { std::fs::File::from_raw_fd(s.into_raw_fd()) }
+            });
+            let stderr = child.stderr.take().map(|s| {
+                use std::os::unix::io::IntoRawFd;
+                unsafe { std::fs::File::from_raw_fd(s.into_raw_fd()) }
+            });
+            let stdin_file = child.stdin.take().map(|s| {
+                use std::os::unix::io::IntoRawFd;
+                unsafe { std::fs::File::from_raw_fd(s.into_raw_fd()) }
+            });
+
+            Ok(StreamSession {
+                stdin: stdin_file,
+                stdout,
+                stderr,
+                pty_master: None,
+                waiter: Box::new(ChildWaiter { child }),
+            })
+        }
+    }
+
+    /// Attach to the container's live stdio using the held pipe/pty fds from
+    /// the io_table (populated by start_container).
+    ///
+    /// Fake limitation: if the container was started in a previous process
+    /// (post-crash, fds lost), returns BackendError::Internal("attach
+    /// unavailable after restart"). Document this in tests.
+    ///
+    /// tty containers: returns a dup of the pty master in both stdout and
+    /// pty_master; no separate stderr.
+    /// pipe containers: returns duped read-ends of stdout/stderr plus the
+    /// write-end of stdin (if held).
+    fn open_attach(&self, id: &ContainerId) -> Result<StreamSession> {
+        // Verify the container is Running
+        {
+            let cache = self.cache.lock().unwrap();
+            let rec = cache
+                .containers
+                .get(id)
+                .ok_or_else(|| BackendError::NotFound(format!("container {}", id.0)))?;
+            if rec.state != ContainerState::Running {
+                return Err(BackendError::FailedPrecondition(format!(
+                    "container {} is not Running (state={:?}); open_attach requires Running",
+                    id.0, rec.state
+                )));
+            }
+        }
+
+        let io = self.io_table.lock().unwrap();
+        let entry = io.get(id).ok_or_else(|| {
+            BackendError::Internal("attach unavailable after restart".to_string())
+        })?;
+
+        if let Some(master) = &entry.pty_master {
+            // tty mode: dup the master for both stdout and pty_master
+            let stdout = dup_file(master).map_err(BackendError::Io)?;
+            let pty_master = dup_file(master).map_err(BackendError::Io)?;
+
+            // Waiter: attach sessions don't own the child; return a no-op waiter
+            struct AttachWaiter;
+            impl ExitWaiter for AttachWaiter {
+                fn wait(self: Box<Self>) -> Result<i32> {
+                    Ok(0)
+                }
+            }
+
+            Ok(StreamSession {
+                stdin: None,
+                stdout: Some(stdout),
+                stderr: None,
+                pty_master: Some(pty_master),
+                waiter: Box::new(AttachWaiter),
+            })
+        } else {
+            // pipe mode: dup the held read-ends
+            let stdout = entry
+                .stdout_rd
+                .as_ref()
+                .map(dup_file)
+                .transpose()
+                .map_err(BackendError::Io)?;
+            let stderr = entry
+                .stderr_rd
+                .as_ref()
+                .map(dup_file)
+                .transpose()
+                .map_err(BackendError::Io)?;
+            let stdin_file = entry
+                .stdin_wr
+                .as_ref()
+                .map(dup_file)
+                .transpose()
+                .map_err(BackendError::Io)?;
+
+            struct AttachWaiter;
+            impl ExitWaiter for AttachWaiter {
+                fn wait(self: Box<Self>) -> Result<i32> {
+                    Ok(0)
+                }
+            }
+
+            Ok(StreamSession {
+                stdin: stdin_file,
+                stdout,
+                stderr,
+                pty_master: None,
+                waiter: Box::new(AttachWaiter),
+            })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// start_container pipe-mode helper (extracted to avoid excessive nesting)
+// ---------------------------------------------------------------------------
+
+impl FakeBackend {
+    #[allow(clippy::too_many_arguments)]
+    fn start_container_pipe_mode(
+        &self,
+        id: &ContainerId,
+        _rec: ContainerRecord,
+        mut cmd: std::process::Command,
+        sandbox_log_dir: String,
+        log_shared: Arc<Mutex<Option<fs::File>>>,
+    ) -> Result<()> {
+        // Persist start intent (crash-only)
+        let started_at = now_nanos();
+        {
+            let mut cache = self.cache.lock().unwrap();
+            let entry = cache
+                .containers
+                .get_mut(id)
+                .ok_or_else(|| BackendError::NotFound(format!("container {}", id.0)))?;
+            entry.state = ContainerState::Running;
+            entry.started_at_nanos = started_at;
+            entry.pid = 0;
+            entry.reason = "starting".to_string();
+            let rec_clone = entry.clone();
+            drop(cache);
+            let filename = format!("{}.json", id.0);
+            atomic_write_json(&self.containers_dir, &filename, &rec_clone)?;
+        }
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let mut cache = self.cache.lock().unwrap();
+                if let Some(entry) = cache.containers.get_mut(id) {
+                    entry.state = ContainerState::Exited;
+                    entry.finished_at_nanos = now_nanos();
+                    entry.exit_code = -1;
+                    entry.reason = "spawn-failed".to_string();
+                    entry.message = e.to_string();
+                    let rec_clone = entry.clone();
+                    drop(cache);
+                    let filename = format!("{}.json", id.0);
+                    let _ = atomic_write_json(&self.containers_dir, &filename, &rec_clone);
+                }
+                return Err(BackendError::Internal(format!(
+                    "spawn container {}: {e}",
+                    id.0
+                )));
+            }
+        };
+
+        let child_pid = child.id();
+
+        // Extract pipe ends and set up tee threads
+        use std::os::unix::io::{FromRawFd, IntoRawFd};
+
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+        let stdin_pipe = child.stdin.take();
+
+        let stdout_rd_for_table: Option<std::fs::File>;
+        let stderr_rd_for_table: Option<std::fs::File>;
+        let stdin_wr_for_table: Option<std::fs::File>;
+
+        if let Some(stdout) = stdout_pipe {
+            let raw = stdout.into_raw_fd();
+            let f_for_tee = unsafe { std::fs::File::from_raw_fd(raw) };
+            // dup for io_table (so tee thread can run independently)
+            let f_for_table = dup_file(&f_for_tee).map_err(BackendError::Io)?;
+            spawn_tee_thread("stdout", f_for_tee, Arc::clone(&log_shared));
+            stdout_rd_for_table = Some(f_for_table);
+        } else {
+            stdout_rd_for_table = None;
+        }
+
+        if let Some(stderr) = stderr_pipe {
+            let raw = stderr.into_raw_fd();
+            let f_for_tee = unsafe { std::fs::File::from_raw_fd(raw) };
+            let f_for_table = dup_file(&f_for_tee).map_err(BackendError::Io)?;
+            spawn_tee_thread("stderr", f_for_tee, Arc::clone(&log_shared));
+            stderr_rd_for_table = Some(f_for_table);
+        } else {
+            stderr_rd_for_table = None;
+        }
+
+        if let Some(stdin) = stdin_pipe {
+            let raw = stdin.into_raw_fd();
+            let f = unsafe { std::fs::File::from_raw_fd(raw) };
+            stdin_wr_for_table = Some(f);
+        } else {
+            stdin_wr_for_table = None;
+        }
+
+        // Store io_table entry
+        {
+            let mut io = self.io_table.lock().unwrap();
+            io.insert(
+                id.clone(),
+                ContainerIo {
+                    pty_master: None,
+                    stdout_rd: stdout_rd_for_table,
+                    stderr_rd: stderr_rd_for_table,
+                    stdin_wr: stdin_wr_for_table,
+                },
+            );
+        }
+
+        // Persist real pid
+        {
+            let mut cache = self.cache.lock().unwrap();
+            let entry = cache
+                .containers
+                .get_mut(id)
+                .ok_or_else(|| BackendError::NotFound(format!("container {}", id.0)))?;
+            entry.pid = child_pid;
+            entry.reason = String::new();
+            let rec_clone = entry.clone();
+            drop(cache);
+            let filename = format!("{}.json", id.0);
+            atomic_write_json(&self.containers_dir, &filename, &rec_clone)?;
+        }
+
+        // Spawn reaper thread
+        let containers_dir = self.containers_dir.clone();
+        let cid = id.clone();
+        let cache_arc = Arc::clone(&self.cache);
+        let io_table_arc = Arc::clone(&self.io_table);
+        let _ = sandbox_log_dir; // captured for completeness; log_shared keeps the file open
+
+        std::thread::spawn(move || {
+            let status = child.wait();
+            let finished_at = now_nanos();
+
+            let (exit_code, reason) = match status {
+                Ok(s) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::process::ExitStatusExt;
+                        if let Some(sig) = s.signal() {
+                            (128 + sig, format!("killed-by-signal-{sig}"))
+                        } else {
+                            (s.code().unwrap_or(0), String::new())
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        (s.code().unwrap_or(0), String::new())
+                    }
+                }
+                Err(e) => (-1, format!("wait-error: {e}")),
+            };
+
+            // Remove io_table entry — fds dropped here
+            io_table_arc.lock().unwrap().remove(&cid);
+
+            let mut cache = cache_arc.lock().unwrap();
+            if let Some(entry) = cache.containers.get_mut(&cid) {
+                if entry.state == ContainerState::Running {
+                    entry.state = ContainerState::Exited;
+                    entry.exit_code = exit_code;
+                    entry.finished_at_nanos = finished_at;
+                    entry.reason = reason;
+                    let rec_clone = entry.clone();
+                    let filename = format!("{}.json", cid.0);
+                    let _ = atomic_write_json(&containers_dir, &filename, &rec_clone);
+                }
+            }
+        });
+
+        Ok(())
     }
 }
 
@@ -1624,5 +2285,275 @@ mod tests {
         let p2 = backend2.pull_image("same:ref").unwrap();
         assert_eq!(p1.root_hex, p2.root_hex);
         assert_eq!(p1.total_size, p2.total_size);
+    }
+
+    // ---- v1.1 WP-A: CRI log tee (§C) ----
+
+    /// Log file created + format correct after a run (tty=false, short-lived cmd)
+    #[test]
+    fn log_file_created_and_format_correct() {
+        let dir = TempDir::new().unwrap();
+        let log_dir = dir.path().join("logs");
+        fs::create_dir_all(&log_dir).unwrap();
+
+        let backend = FakeBackend::open(dir.path()).unwrap();
+
+        let mut sb_cfg = minimal_sandbox_cfg("sb");
+        sb_cfg.log_directory = log_dir.to_str().unwrap().to_string();
+        let sb = backend.run_sandbox(sb_cfg).unwrap();
+
+        let mut cfg = minimal_container_cfg("log-test");
+        cfg.command = vec!["/bin/sh".to_string()];
+        cfg.args = vec!["-c".to_string(), "echo hello-log".to_string()];
+        cfg.log_path = "test.log".to_string();
+        cfg.tty = false;
+        cfg.stdin = false;
+
+        let cid = backend.create_container(&sb, cfg).unwrap();
+
+        // Log file must exist immediately after start (kubelet ReopenContainerLog law)
+        backend.start_container(&cid).unwrap();
+        let log_path = log_dir.join("test.log");
+        assert!(
+            log_path.exists(),
+            "log file must exist after start_container"
+        );
+
+        // Wait for process to finish and tee thread to flush
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let contents = fs::read_to_string(&log_path).unwrap();
+        // Must have at least one CRI-format line: <ts> stdout F hello-log\n
+        let mut found = false;
+        for line in contents.lines() {
+            // Format: <RFC3339Nano> stdout F hello-log
+            let parts: Vec<&str> = line.splitn(4, ' ').collect();
+            if parts.len() >= 4
+                && parts[1] == "stdout"
+                && parts[2] == "F"
+                && parts[3].contains("hello-log")
+            {
+                found = true;
+            }
+        }
+        assert!(
+            found,
+            "CRI-format log line not found; contents: {contents:?}"
+        );
+
+        backend.stop_container(&cid, 0).unwrap();
+        backend.remove_container(&cid).unwrap();
+        backend.remove_sandbox(&sb).unwrap();
+    }
+
+    /// Log file is created (empty) immediately even if the process emits nothing
+    #[test]
+    fn log_file_created_even_if_no_output() {
+        let dir = TempDir::new().unwrap();
+        let log_dir = dir.path().join("logs2");
+        fs::create_dir_all(&log_dir).unwrap();
+
+        let backend = FakeBackend::open(dir.path()).unwrap();
+
+        let mut sb_cfg = minimal_sandbox_cfg("sb");
+        sb_cfg.log_directory = log_dir.to_str().unwrap().to_string();
+        let sb = backend.run_sandbox(sb_cfg).unwrap();
+
+        let mut cfg = minimal_container_cfg("silent");
+        cfg.command = vec!["/bin/sleep".to_string()];
+        cfg.args = vec!["60".to_string()];
+        cfg.log_path = "silent.log".to_string();
+
+        let cid = backend.create_container(&sb, cfg).unwrap();
+        backend.start_container(&cid).unwrap();
+
+        let log_path = log_dir.join("silent.log");
+        assert!(
+            log_path.exists(),
+            "empty log file must exist immediately after start"
+        );
+
+        backend.stop_container(&cid, 0).unwrap();
+        backend.remove_container(&cid).unwrap();
+        backend.remove_sandbox(&sb).unwrap();
+    }
+
+    // ---- v1.1 WP-A: open_exec (§B) ----
+
+    /// open_exec echo + exit code 0 (tty=false)
+    #[test]
+    fn open_exec_echo_and_exit_code_zero() {
+        let (_dir, backend) = tmp_backend();
+        let sb = backend.run_sandbox(minimal_sandbox_cfg("sb")).unwrap();
+        let mut cfg = minimal_container_cfg("c");
+        cfg.command = vec!["/bin/sleep".to_string()];
+        cfg.args = vec!["60".to_string()];
+        let cid = backend.create_container(&sb, cfg).unwrap();
+        backend.start_container(&cid).unwrap();
+
+        let cmd = vec!["/bin/echo".to_string(), "exec-hello".to_string()];
+        let mut session = backend.open_exec(&cid, &cmd, false, false).unwrap();
+
+        // Read stdout
+        use std::io::Read;
+        let mut out = Vec::new();
+        if let Some(mut f) = session.stdout.take() {
+            f.read_to_end(&mut out).unwrap();
+        }
+        let exit_code = session.waiter.wait().unwrap();
+
+        assert_eq!(exit_code, 0);
+        assert!(
+            out.starts_with(b"exec-hello"),
+            "stdout: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+
+        backend.stop_container(&cid, 0).unwrap();
+        backend.remove_container(&cid).unwrap();
+        backend.remove_sandbox(&sb).unwrap();
+    }
+
+    /// open_exec exit code 7
+    #[test]
+    fn open_exec_exit_code_7() {
+        let (_dir, backend) = tmp_backend();
+        let sb = backend.run_sandbox(minimal_sandbox_cfg("sb")).unwrap();
+        let mut cfg = minimal_container_cfg("c");
+        cfg.command = vec!["/bin/sleep".to_string()];
+        cfg.args = vec!["60".to_string()];
+        let cid = backend.create_container(&sb, cfg).unwrap();
+        backend.start_container(&cid).unwrap();
+
+        let cmd = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "exit 7".to_string(),
+        ];
+        let session = backend.open_exec(&cid, &cmd, false, false).unwrap();
+        let exit_code = session.waiter.wait().unwrap();
+        assert_eq!(exit_code, 7);
+
+        backend.stop_container(&cid, 0).unwrap();
+        backend.remove_container(&cid).unwrap();
+        backend.remove_sandbox(&sb).unwrap();
+    }
+
+    /// open_exec on non-Running container → FailedPrecondition
+    #[test]
+    fn open_exec_non_running_fails_precondition() {
+        let (_dir, backend) = tmp_backend();
+        let sb = backend.run_sandbox(minimal_sandbox_cfg("sb")).unwrap();
+        let cid = backend
+            .create_container(&sb, minimal_container_cfg("c"))
+            .unwrap();
+        // Container is in Created state
+        let cmd = vec!["/bin/echo".to_string(), "hi".to_string()];
+        let result = backend.open_exec(&cid, &cmd, false, false);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err(FailedPrecondition), got Ok"),
+        };
+        assert!(
+            matches!(err, BackendError::FailedPrecondition(_)),
+            "expected FailedPrecondition, got: {err}"
+        );
+    }
+
+    /// open_exec with tty=true: a line written via the slave is readable from master
+    #[test]
+    fn open_exec_tty_writes_line() {
+        let (_dir, backend) = tmp_backend();
+        let sb = backend.run_sandbox(minimal_sandbox_cfg("sb")).unwrap();
+        let mut cfg = minimal_container_cfg("c");
+        cfg.command = vec!["/bin/sleep".to_string()];
+        cfg.args = vec!["60".to_string()];
+        let cid = backend.create_container(&sb, cfg).unwrap();
+        backend.start_container(&cid).unwrap();
+
+        // echo a line — the output goes to the pty slave, readable via master
+        let cmd = vec!["/bin/echo".to_string(), "pty-hello".to_string()];
+        let mut session = backend.open_exec(&cid, &cmd, true, false).unwrap();
+        // stdout == pty master clone
+        assert!(
+            session.pty_master.is_some(),
+            "pty_master must be Some for tty=true"
+        );
+        assert!(session.stdout.is_some(), "stdout must be Some for tty=true");
+
+        // Read a few bytes from stdout (pty master)
+        use std::io::Read;
+        let mut buf = [0u8; 256];
+        let mut total = Vec::new();
+        // Give child time to write and pty to flush
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        if let Some(mut f) = session.stdout.take() {
+            // Non-blocking: read what's available
+            use std::os::unix::io::AsRawFd;
+            let fd = f.as_raw_fd();
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+            let _ = f.read(&mut buf).map(|n| total.extend_from_slice(&buf[..n]));
+        }
+        let _ = session.waiter.wait();
+
+        // pty output includes CR-LF; check for our string somewhere in output
+        let s = String::from_utf8_lossy(&total);
+        assert!(
+            s.contains("pty-hello"),
+            "expected 'pty-hello' in pty output, got: {s:?}"
+        );
+
+        backend.stop_container(&cid, 0).unwrap();
+        backend.remove_container(&cid).unwrap();
+        backend.remove_sandbox(&sb).unwrap();
+    }
+
+    /// open_attach on a non-Running container → FailedPrecondition
+    #[test]
+    fn open_attach_non_running_fails_precondition() {
+        let (_dir, backend) = tmp_backend();
+        let sb = backend.run_sandbox(minimal_sandbox_cfg("sb")).unwrap();
+        let cid = backend
+            .create_container(&sb, minimal_container_cfg("c"))
+            .unwrap();
+        let err = match backend.open_attach(&cid) {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err(FailedPrecondition), got Ok"),
+        };
+        assert!(matches!(err, BackendError::FailedPrecondition(_)));
+    }
+
+    /// open_attach after restart (no io_table entry) → Internal error
+    #[test]
+    fn open_attach_unavailable_after_restart() {
+        let dir = TempDir::new().unwrap();
+        let cid = {
+            let backend = FakeBackend::open(dir.path()).unwrap();
+            let sb = backend.run_sandbox(minimal_sandbox_cfg("sb")).unwrap();
+            let mut cfg = minimal_container_cfg("c");
+            cfg.command = vec!["/bin/sleep".to_string()];
+            cfg.args = vec!["300".to_string()];
+            let cid = backend.create_container(&sb, cfg).unwrap();
+            backend.start_container(&cid).unwrap();
+            cid
+            // backend dropped here — io_table is lost
+        };
+        // Re-open: container is still Running (pid alive), but io_table is empty
+        let backend2 = FakeBackend::open(dir.path()).unwrap();
+        let status = backend2.container_status(&cid).unwrap();
+        assert_eq!(status.state, ContainerState::Running);
+        let err = match backend2.open_attach(&cid) {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err(Internal), got Ok"),
+        };
+        assert!(
+            matches!(&err, BackendError::Internal(m) if m.contains("attach unavailable after restart")),
+            "expected Internal(attach unavailable after restart), got: {err}"
+        );
+        backend2.stop_container(&cid, 0).unwrap();
+        backend2.remove_container(&cid).unwrap();
     }
 }

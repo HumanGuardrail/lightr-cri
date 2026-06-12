@@ -12,6 +12,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 blake3 = { workspace = true }
 libc = { workspace = true }
+nix = { workspace = true, features = ["term", "process", "fs", "sched", "signal"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
