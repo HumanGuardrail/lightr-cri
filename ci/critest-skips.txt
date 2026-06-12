@@ -1,116 +1,88 @@
-# critest skip-list — frozen; one ginkgo regex per line.
-# Format: <regex>  # reason → R1
+# critest skip-list — R1 narrowed; one ginkgo regex per line.
+# Format: <regex>  # reason → R2
 # These are joined by | and passed to critest as --ginkgo.skip.
 # Conservative: skip whole Describe blocks by keyword to avoid
 # partial-suite fragility. Add conquered items to tests/GREENLIST instead.
+#
+# R1 GRADED FAMILIES (removed from skip-list in WP-G R1):
+#   - Streaming (Exec/Attach/PortForward): WP-C/D implement SPDY+WS; graded R1.
+#   - Networking (Network/CNI/PodNetwork/HostNetwork/DNS/PortMapping/Portforward):
+#       WP-B/D implement CNI bridge+host-local+portmap + netns lifecycle; graded R1.
+#   - Container log (CRI log format): WP-A implements log tee + CRI format; graded R1.
+#   - Image default-command (starting container): WP-A implements command from
+#       image config; graded R1.
+# These families now surface as CANDIDATE items on the first green R1 linux run;
+# lead appends confirmed passes to tests/GREENLIST.
 
-# Streaming RPCs (Exec/Attach/PortForward) — UNIMPLEMENTED in R0; returns gRPC
-# UNIMPLEMENTED per build-spec-r0 §5.
-[Ee]xec  # reason → R1
-[Aa]ttach  # reason → R1
-[Pp]ort[Ff]orward  # reason → R1
-[Ss]treaming  # reason → R1
-
-# CNI / networking-dependent suites — no CNI plugin in CI runner.
-[Nn]etwork  # reason → R1
-[Cc][Nn][Ii]  # reason → R1
-[Pp]od [Nn]etwork  # reason → R1
-should support.*[Nn]etwork  # reason → R1
-[Bb]andwidth  # reason → R1
-[Dd][Nn][Ss]  # reason → R1
-[Hh]ost[Nn]etwork  # reason → R1
-[Pp]ort [Mm]apping  # reason → R1
-
-# RuntimeConfig / UpdateRuntimeConfig — UNIMPLEMENTED in R0.
-[Rr]untime[Cc]onfig  # reason → R1
-[Uu]pdate[Rr]untime[Cc]onfig  # reason → R1
-[Rr]untime [Cc]onfig  # reason → R1
+# RuntimeConfig / UpdateRuntimeConfig — UNIMPLEMENTED (literal code per
+# r1-kubelet-smoke.md law; any other code = kubelet startup fails). R2 N/A.
+[Rr]untime[Cc]onfig  # reason → R2
+[Uu]pdate[Rr]untime[Cc]onfig  # reason → R2
+[Rr]untime [Cc]onfig  # reason → R2
 
 # Container stats beyond basic (metrics descriptors, WritableLayer stats) —
 # fake backend returns zeroed values; descriptor-level assertions fail.
-[Ww]ritable[Ll]ayer  # reason → R1
-[Mm]etrics [Dd]escriptor  # reason → R1
-[Cc]ontainer[Ff][Ss][Ss]tats  # reason → R1
-[Ii]mage[Ff][Ss][Ss]tats  # reason → R1
+[Ww]ritable[Ll]ayer  # reason → R2
+[Mm]etrics [Dd]escriptor  # reason → R2
+[Cc]ontainer[Ff][Ss][Ss]tats  # reason → R2
+[Ii]mage[Ff][Ss][Ss]tats  # reason → R2
 
-# Checkpoint/restore — UNIMPLEMENTED in R0.
-[Cc]heckpoint  # reason → R1
-[Rr]estore  # reason → R1
+# Checkpoint/restore — UNIMPLEMENTED; no checkpoint engine in scope.
+[Cc]heckpoint  # reason → R2
+[Rr]estore  # reason → R2
 
-# Events / GetContainerEvents — UNIMPLEMENTED in R0.
-[Ee]vent  # reason → R1
-[Cc]ontainer[Ee]vents  # reason → R1
-[Pp][Ll][Ee][Gg]  # reason → R1
+# Events / GetContainerEvents — evented PLEG alpha off in kubelet 1.33;
+# DESCOPED to R2 per build-spec-r1 §1.
+[Ee]vent  # reason → R2
+[Cc]ontainer[Ee]vents  # reason → R2
+[Pp][Ll][Ee][Gg]  # reason → R2
 
-# UpdateContainerResources — UNIMPLEMENTED in R0.
-[Uu]pdate[Cc]ontainer[Rr]esources  # reason → R1
-[Rr]esource [Uu]pdate  # reason → R1
+# UpdateContainerResources — UNIMPLEMENTED; no cgroup resource update path.
+[Uu]pdate[Cc]ontainer[Rr]esources  # reason → R2
+[Rr]esource [Uu]pdate  # reason → R2
 
-# ReopenContainerLog — UNIMPLEMENTED in R0.
-[Rr]eopen  # reason → R1
-[Rr]eopen[Cc]ontainer[Ll]og  # reason → R1
+# ReopenContainerLog — tolerated per kubelet matrix (log spam only); not
+# blocking R1 but the describe block still fails on assertions.
+[Rr]eopen  # reason → R2
+[Rr]eopen[Cc]ontainer[Ll]og  # reason → R2
 
 # Security Context (all sub-describes: NamespaceOption, bucket, SeccompProfilePath,
-# NoNewPrivs) — needs real isolation engine (setuid/seccomp/capabilities/namespaces).
-# All 23 items in this describe failed; none passed. Whole block safe to skip.
-Security Context  # reason → R1
+# NoNewPrivs, setuid/seccomp/caps/namespaces) — needs real isolation engine.
+# All 23 items failed in R0; none passed. Whole block safe to skip. R2.
+Security Context  # reason → R2
 
-# Container Mount Readonly — needs privileged mount support (tmpfs/bind-mount syscalls
-# require CAP_SYS_ADMIN; fake backend has no mount namespace).
-# Only item: "should support non-recursive readonly mounts"
-should support non-recursive readonly mounts  # reason → R1
+# Container Mount Readonly — needs privileged mount support (tmpfs/bind-mount
+# syscalls require CAP_SYS_ADMIN; fake backend has no mount namespace). R2.
+should support non-recursive readonly mounts  # reason → R2
 
-# Container Mount Propagation — needs privileged mount support (bind-mount propagation
-# requires real mount namespace + CAP_SYS_ADMIN; fake backend is unnamespaced).
-# Items: rprivate/rshared/rslave propagation
-Mount Propagation  # reason → R1
+# Container Mount Propagation — needs privileged mount support (bind-mount
+# propagation requires real mount namespace + CAP_SYS_ADMIN). R2.
+Mount Propagation  # reason → R2
 
 # Container OOM — needs cgroup memory limits (cgroup v1/v2 memory.limit_in_bytes;
-# fake backend runs plain host processes with no cgroup isolation).
-# Item: "should terminate with exitCode 137 and reason OOMKilled"
-OOMKilled  # reason → R1
-should output OOMKilled reason  # reason → R1
+# fake backend runs plain host processes with no cgroup isolation). R2.
+OOMKilled  # reason → R2
+should output OOMKilled reason  # reason → R2
 
-# Multiple Containers — pod shared-namespace semantics (PID/IPC/net sharing across
-# multiple containers in a pod requires real namespace sharing; fake does not implement).
-# Item: "when running multiple containers in a pod"
-Multiple Containers  # reason → R1
+# Multiple Containers — pod shared-namespace semantics (PID/IPC/net sharing
+# requires real namespace sharing; fake does not implement). R2.
+Multiple Containers  # reason → R2
 
-# Container log — CRI log-file format infra (fake does not write the CRI log format
-# to the container's log_path; critest verifies structured log content).
-# It-level skip: only "starting container with log" fails; other log items may pass.
-runtime should support starting container with log  # reason → R1
+# Remove running container (force-remove) — fake refuses FailedPrecondition.
+# Conquerable once force-stop semantics are settled. FLAGGED.
+runtime should support removing running container  # reason → R2
 
-# Remove running container (force-remove) — CRI allows RemoveContainer on Running
-# containers as a force-removal; fake currently refuses (FailedPrecondition).
-# It-level skip; conquerable in a future wave once force-stop semantics are settled.
-# FLAGGED: this item is conquerable — fake should force-stop then remove.
-runtime should support removing running container  # reason → R1
+# PodSandbox sysctls — needs real Linux kernel sysctl namespace. R2.
+should support.*sysctls  # reason → R2
+runtime should support sysctls  # reason → R2
 
-# Starting container (exits naturally) — the test starts a container with the image's
-# default command and waits up to 60s for Exited state. In the Docker CI environment,
-# the spawned process does not exit within the timeout (image entrypoint semantics:
-# fake images have no real binaries; the host process spawned by the fake hangs or the
-# command is long-running). Timing-sensitive; environment-dependent.
-# FLAGGED: conquerable once we implement proper container command from image config.
-# Note: The spec name contains "[Conformance]"; the regex below matches only this It.
-runtime should support starting container  # reason → R1
-
-# PodSandbox sysctls — needs real Linux kernel sysctl namespace (net.*,kernel.*
-# writes require a namespaced /proc/sys; fake runs unnamespaced).
-# Items: "should support safe sysctls", "should support unsafe sysctls"
-should support.*sysctls  # reason → R1
-runtime should support sysctls  # reason → R1
-
-# Image Manager — fake images are synthetic CAS records; critest expects real OCI
-# image semantics (multi-tag deduplication, image fields uid/username, digest refs,
-# public image pull from registry). All 7 tested items failed; none passed.
-# It-level skips to avoid catching future conquered items in other Image Manager tests.
-public image with tag should be pulled and removed  # reason → R1
-public image without tag should be pulled and removed  # reason → R1
-public image with digest should be pulled and removed  # reason → R1
-image status should support all kinds of references  # reason → R1
-image status get image fields should not have Uid  # reason → R1
-listImage should get exactly 3 image in the result list  # reason → R1
-listImage should get exactly 3 repoTags  # reason → R1
-public image should timeout if requested  # reason → R1
+# Image Manager — fake images are synthetic CAS records; critest expects real
+# OCI image semantics. All 7 items failed; none passed in R0. R2.
+public image with tag should be pulled and removed  # reason → R2
+public image without tag should be pulled and removed  # reason → R2
+public image with digest should be pulled and removed  # reason → R2
+image status should support all kinds of references  # reason → R2
+image status get image fields should not have Uid  # reason → R2
+listImage should get exactly 3 image in the result list  # reason → R2
+listImage should get exactly 3 repoTags  # reason → R2
+public image should timeout if requested  # reason → R2

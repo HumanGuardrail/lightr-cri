@@ -85,6 +85,56 @@ jobs:
           crictl --version
           critest --version
 
+      - name: install CNI plugins v1.9.1 and kubelet v1.33.13 (pinned sha256)
+        run: |
+          set -euo pipefail
+
+          # CNI plugins v1.9.1 — amd64
+          CNI_SHA256="b98f74a0f8522f0a83867178729c1aa70f2158f90c45a2ca8fa791db1c76b303"
+          CNI_URL="https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz"
+          curl -fsSL -o /tmp/cni-plugins.tgz "${CNI_URL}"
+          echo "${CNI_SHA256}  /tmp/cni-plugins.tgz" | sha256sum -c -
+          sudo mkdir -p /opt/cni/bin
+          sudo tar -C /opt/cni/bin -xzf /tmp/cni-plugins.tgz
+          rm /tmp/cni-plugins.tgz
+
+          # Write bridge+host-local+portmap conflist (smallest honest setup per r1-cni.md)
+          sudo mkdir -p /etc/cni/net.d
+          sudo tee /etc/cni/net.d/10-lightr.conflist >/dev/null <<'CONFLIST_EOF'
+          {
+            "cniVersion": "1.0.0",
+            "name": "lightr",
+            "plugins": [
+              {
+                "type": "bridge",
+                "bridge": "cni0",
+                "isGateway": true,
+                "ipMasq": true,
+                "ipam": {
+                  "type": "host-local",
+                  "subnet": "10.88.0.0/16",
+                  "routes": [{ "dst": "0.0.0.0/0" }]
+                }
+              },
+              {
+                "type": "portmap",
+                "capabilities": { "portMappings": true }
+              }
+            ]
+          }
+          CONFLIST_EOF
+          echo "CNI plugins installed; conflist written to /etc/cni/net.d/10-lightr.conflist"
+
+          # kubelet v1.33.13 — cache at /tmp/kubelet-cache/kubelet
+          KUBELET_SHA256="0415ef7778646172f7aad830cbe09a7d903461eef9e15cd34193b85d95dfff0d"
+          KUBELET_URL="https://dl.k8s.io/release/v1.33.13/bin/linux/amd64/kubelet"
+          KUBELET_CACHE="/tmp/kubelet-cache"
+          mkdir -p "${KUBELET_CACHE}"
+          curl -fsSL -o "${KUBELET_CACHE}/kubelet" "${KUBELET_URL}"
+          echo "${KUBELET_SHA256}  ${KUBELET_CACHE}/kubelet" | sha256sum -c -
+          chmod +x "${KUBELET_CACHE}/kubelet"
+          echo "kubelet v1.33.13 cached at ${KUBELET_CACHE}/kubelet"
+
       - name: cargo test --workspace (A9 vectors + fake + shell + acceptance A1–A8)
         run: cargo test --workspace
 
@@ -96,6 +146,12 @@ jobs:
 
       - name: greenlist gate
         run: bash ci/greenlist-gate.sh
+
+      - name: B7 kubelet-smoke gate
+        env:
+          LIGHTR_CRI_BIN: target/release/lightr-cri
+          KUBELET_BIN: /tmp/kubelet-cache/kubelet
+        run: bash ci/kubelet-smoke.sh
 
   # ── verify-codegen: regenerate proto, diff must be empty ─────────────────
   verify-codegen:
