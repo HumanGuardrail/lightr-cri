@@ -42,7 +42,9 @@ jobs:
   # ── Linux: full conformance (vectors A9, fake, shell, acceptance A1–A8, A10) ──
   linux-conformance:
     runs-on: [self-hosted, linux]
-    timeout-minutes: 45
+    # shared-docker machine class: cold builds + critest on a loaded host
+    # exceeded 45m (observed 46m21s → GitHub reports timeout as 'cancelled')
+    timeout-minutes: 90
     env:
       LIGHTR_CRI_REQUIRE_PROBES: "1"
       LIGHTR_BUDGET_CLASS: shared-docker
