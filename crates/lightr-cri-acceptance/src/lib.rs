@@ -173,6 +173,35 @@ pub fn crictl(sock: &Path, args: &[&str]) -> std::io::Result<std::process::Outpu
         .output()
 }
 
+/// Probe: is `cap` set in the effective capability bitmask?
+///
+/// Uses `/proc/self/status` (CapEff line) on Linux; always returns `false`
+/// on other platforms.  Errors are treated as "not available".
+pub fn have_cap_sys_admin() -> bool {
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::BufRead;
+        let Ok(f) = std::fs::File::open("/proc/self/status") else {
+            return false;
+        };
+        for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
+            if let Some(hex) = line.strip_prefix("CapEff:\t") {
+                if let Ok(bits) = u64::from_str_radix(hex.trim(), 16) {
+                    // CAP_SYS_ADMIN = 21, CAP_NET_ADMIN = 12
+                    let sys_admin = (bits >> 21) & 1 == 1;
+                    let net_admin = (bits >> 12) & 1 == 1;
+                    return sys_admin && net_admin;
+                }
+            }
+        }
+        false
+    }
+}
+
 /// A10 harness: builds a `critest` Command reading the skip list from
 /// `skips_file` (lines; `#` comments; the regex is everything before any ` #`).
 pub fn critest_cmd(sock: &Path, skips_file: &Path) -> Command {
