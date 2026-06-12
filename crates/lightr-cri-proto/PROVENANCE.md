@@ -9,4 +9,7 @@
   sha256 `f2f77edf7de807ded7884813d851656f4ccb18262db717a8f31061995f3e7324`)
 - Codegen: committed under `src/generated/` via `tools/protogen`
   (tonic-build; no build.rs, no protoc needed by consumers).
-  CI job `verify-codegen` re-runs protogen and diffs — drift is red.
+  Generated with **protoc 25.3 linux-x86_64** (the exact CI pin) inside
+  `rust:1.96-bookworm` — regeneration must use the same protoc or the diff
+  gate goes red by design. CI job `verify-codegen` re-runs protogen and
+  diffs — drift is red.
