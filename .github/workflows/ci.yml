@@ -18,6 +18,9 @@ jobs:
           rustup toolchain install 1.96.0 --profile minimal --no-self-update
           rustup override set 1.96.0
           rustup component add clippy
+          # This host's rustup proxy breaks intermittently (known machine
+          # quirk): bypass it with the toolchain's direct bin dir.
+          echo "$HOME/.rustup/toolchains/1.96.0-x86_64-apple-darwin/bin" >> "$GITHUB_PATH"
 
       - name: cargo build --workspace
         run: cargo build --workspace
