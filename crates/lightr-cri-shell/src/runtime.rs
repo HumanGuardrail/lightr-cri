@@ -1,33 +1,77 @@
-//! WP-2: implement `runtime_service_server::RuntimeService` for
-//! `RuntimeShell<B>` (build-spec-r0 §5). Translation only: decode proto →
-//! backend call inside `tokio::task::spawn_blocking` → encode proto.
+//! WP-D: implement `runtime_service_server::RuntimeService` for
+//! `RuntimeShell<B>` (build-spec-r1 §3 WP-D).
 //!
-//! FROZEN laws:
-//! - ZERO state beyond `backend` (any caching field = REJECT).
-//! - Version: runtime_name="lightr", runtime_api_version="v1".
-//! - Status: Runtime+Network conditions, network=true in R0 fake mode.
-//! - Unimplemented in R0 (explicit message naming R1): Exec, Attach,
-//!   PortForward, GetContainerEvents, UpdateRuntimeConfig,
-//!   UpdateContainerResources, ReopenContainerLog, checkpoint RPCs.
+//! FROZEN laws (carry-over from R0 + R1 additions):
+//! - State: Arc<backend> + Arc<TokenRegistry> + base_url (stream server).
+//!   NOTHING ELSE. Any additional cached field = REJECT.
+//!   Token registry is ephemeral by definition (crash-only): tokens lost on
+//!   restart = clients retry. Document here so the pattern is explicit.
+//! - Exec/Attach/PortForward: validate state via backend, mint a token on the
+//!   shared registry, return an absolute URL:
+//!   `http://127.0.0.1:<port>/<verb>/<token>`.
+//! - v1.1 decode: RunPodSandbox decodes dns, port_mappings, host_network,
+//!   hostname. CreateContainer decodes tty/stdin.
+//!   PodSandboxStatus.network.ip from SandboxStatus.ip.
+//!   Status.NetworkReady: honest from backend (fake → true via host_network).
+//! - RuntimeConfig: literal UNIMPLEMENTED (kubelet 1.33 never calls it;
+//!   alpha gate off — r1-kubelet-smoke.md law).
 //! - Errors map via `crate::map_err` only.
 
 use std::sync::Arc;
 
 use lightr_cri_backend::{
-    ContainerConfig, ContainerFilter, ContainerId, ContainerState, CriBackend, Mount,
-    SandboxConfig, SandboxFilter, SandboxId, SandboxState,
+    ContainerConfig, ContainerFilter, ContainerId, ContainerState, CriBackend, DnsConfig, Mount,
+    PortMapping, Protocol, SandboxConfig, SandboxFilter, SandboxId, SandboxState,
 };
 use lightr_cri_proto::v1 as proto;
 use lightr_cri_proto::v1::runtime_service_server::RuntimeService;
+use lightr_cri_stream::{ServerHandle, StreamParams, StreamVerb, TokenRegistry};
 use tonic::{Request, Response, Status};
 
 pub struct RuntimeShell<B: CriBackend> {
     pub backend: Arc<B>,
+    /// Shared token registry from the stream server (crash-only: tokens are
+    /// ephemeral — lost on restart — clients retry, per spec §3 WP-D).
+    pub registry: Arc<TokenRegistry>,
+    /// Bound base URL of the stream server, e.g. `http://127.0.0.1:54321`.
+    pub base_url: String,
 }
 
 impl<B: CriBackend> RuntimeShell<B> {
     pub fn new(backend: Arc<B>) -> Self {
-        Self { backend }
+        // Legacy R0 constructor — no stream server. Only used from tests that
+        // don't exercise Exec/Attach/PortForward.  Stream URL methods will
+        // return an empty base (no tokens minted without a registry).
+        Self {
+            backend,
+            registry: Arc::new(TokenRegistry::new()),
+            base_url: String::new(),
+        }
+    }
+
+    /// R1 constructor: wire the stream server handle into the shell.
+    /// `handle` must be the live handle returned by `lightr_cri_stream::serve`.
+    pub fn with_stream(backend: Arc<B>, handle: &ServerHandle) -> Self {
+        Self {
+            backend,
+            registry: Arc::clone(handle.registry()),
+            base_url: handle.base_url().to_string(),
+        }
+    }
+
+    /// Mint an absolute streaming URL for `verb` with `params`.
+    /// Returns `Status::resource_exhausted` if the registry cap (1000) is hit.
+    ///
+    /// `Status` is ~176 bytes but it is the correct return type for gRPC
+    /// handlers; boxing here would make every call-site awkward. Allow the
+    /// large-err lint for this helper only.
+    #[allow(clippy::result_large_err)]
+    fn mint_url(&self, verb: StreamVerb, params: StreamParams) -> Result<String, Status> {
+        let token = self
+            .registry
+            .mint(verb, params)
+            .ok_or_else(|| Status::resource_exhausted("too many streaming tokens in flight"))?;
+        Ok(format!("{}/{}/{}", self.base_url, verb.path(), token))
     }
 }
 
@@ -115,7 +159,49 @@ fn proto_stats_filter(f: Option<proto::ContainerStatsFilter>) -> ContainerFilter
     }
 }
 
+/// Decode proto DnsConfig → backend DnsConfig.
+fn decode_dns(d: Option<proto::DnsConfig>) -> Option<DnsConfig> {
+    d.map(|d| DnsConfig {
+        servers: d.servers,
+        searches: d.searches,
+        options: d.options,
+    })
+}
+
+/// Decode a single proto PortMapping → backend PortMapping.
+fn decode_port_mapping(pm: proto::PortMapping) -> PortMapping {
+    let protocol = match pm.protocol {
+        // proto Protocol enum: 0=TCP, 1=UDP, 2=SCTP
+        x if x == proto::Protocol::Udp as i32 => Protocol::Udp,
+        x if x == proto::Protocol::Sctp as i32 => Protocol::Sctp,
+        _ => Protocol::Tcp,
+    };
+    PortMapping {
+        protocol,
+        container_port: pm.container_port,
+        host_port: pm.host_port,
+        host_ip: pm.host_ip,
+    }
+}
+
+/// Decode host_network from LinuxPodSandboxConfig.
+/// network == NODE (2) → host_network=true.
+fn decode_host_network(linux: &Option<proto::LinuxPodSandboxConfig>) -> bool {
+    linux
+        .as_ref()
+        .and_then(|l| l.security_context.as_ref())
+        .and_then(|sc| sc.namespace_options.as_ref())
+        .map(|ns| ns.network == proto::NamespaceMode::Node as i32)
+        .unwrap_or(false)
+}
+
 fn build_sandbox_status(s: &lightr_cri_backend::SandboxStatus) -> proto::PodSandboxStatus {
+    // PodSandboxNetworkStatus.ip: from SandboxStatus.ip (v1.1 §A).
+    // None → empty string (proto default; kubelet treats empty as "no IP").
+    let network = Some(proto::PodSandboxNetworkStatus {
+        ip: s.ip.clone().unwrap_or_default(),
+        additional_ips: vec![],
+    });
     proto::PodSandboxStatus {
         id: s.id.0.clone(),
         metadata: Some(proto::PodSandboxMetadata {
@@ -126,7 +212,7 @@ fn build_sandbox_status(s: &lightr_cri_backend::SandboxStatus) -> proto::PodSand
         }),
         state: map_sandbox_state(s.state),
         created_at: s.created_at_nanos,
-        network: None,
+        network,
         linux: None,
         labels: s.config.labels.clone().into_iter().collect(),
         annotations: s.config.annotations.clone().into_iter().collect(),
@@ -262,7 +348,52 @@ fn build_container_stats(
     }
 }
 
-// ── Associated stream type for GetContainerEvents (UNIMPLEMENTED in R0) ──────
+// ── Validation helpers (free-standing async fns to avoid large-err closures) ──
+
+/// Verify a container exists and is in Running state.
+// Status is ~176 bytes; it is the canonical gRPC error type here.
+#[allow(clippy::result_large_err)]
+async fn validate_container_running<B: CriBackend>(
+    backend: Arc<B>,
+    id: ContainerId,
+) -> Result<(), Status> {
+    tokio::task::spawn_blocking(move || {
+        let cs = backend.container_status(&id).map_err(crate::map_err)?;
+        if cs.state != ContainerState::Running {
+            return Err(Status::failed_precondition(format!(
+                "container {} is not Running (state={:?})",
+                id.0, cs.state
+            )));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| Status::internal(format!("spawn_blocking join error: {e}")))?
+}
+
+/// Verify a sandbox exists and is Ready; return its dial_target (ip or 127.0.0.1).
+// Status is ~176 bytes; it is the canonical gRPC error type here.
+#[allow(clippy::result_large_err)]
+async fn validate_sandbox_ready_get_ip<B: CriBackend>(
+    backend: Arc<B>,
+    id: SandboxId,
+) -> Result<String, Status> {
+    tokio::task::spawn_blocking(move || {
+        let ss = backend.sandbox_status(&id).map_err(crate::map_err)?;
+        if ss.state != SandboxState::Ready {
+            return Err(Status::failed_precondition(format!(
+                "sandbox {} is not Ready (state={:?})",
+                id.0, ss.state
+            )));
+        }
+        // dial_target: sandbox ip if set, else 127.0.0.1 (host_network path)
+        Ok(ss.ip.unwrap_or_else(|| "127.0.0.1".to_string()))
+    })
+    .await
+    .map_err(|e| Status::internal(format!("spawn_blocking join error: {e}")))?
+}
+
+// ── Associated stream type for GetContainerEvents (UNIMPLEMENTED in R1) ──────
 
 type GetContainerEventsStream = std::pin::Pin<
     Box<
@@ -295,6 +426,11 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
         request: Request<proto::StatusRequest>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
         let verbose = request.into_inner().verbose;
+        // NetworkReady: honest from backend.
+        // For the fake backend, sandboxes are host_network (no CNI required);
+        // report NetworkReady=true with an annotation explaining the model.
+        // A real CNI-capable backend should probe availability here (WP-B).
+        // ANNOTATE: fake backend uses host_network; CNI not required.
         let conditions = vec![
             proto::RuntimeCondition {
                 r#type: "RuntimeReady".to_string(),
@@ -304,12 +440,13 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
             },
             proto::RuntimeCondition {
                 r#type: "NetworkReady".to_string(),
+                // fake: host_network sandboxes; no CNI probe needed (annotated).
                 status: true,
                 reason: String::new(),
-                message: "r0-fake-network".to_string(),
+                message: "fake-host-network-no-cni".to_string(),
             },
         ];
-        // info is always empty in R0 regardless of verbose
+        // info is empty (verbose detail deferred to R2 structured status)
         let _ = verbose;
         Ok(Response::new(proto::StatusResponse {
             status: Some(proto::RuntimeStatus { conditions }),
@@ -332,6 +469,17 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
         let meta = pod_cfg
             .metadata
             .ok_or_else(|| Status::invalid_argument("config.metadata is required"))?;
+
+        // v1.1 decode: dns, port_mappings, host_network (network==NODE), hostname
+        let dns = decode_dns(pod_cfg.dns_config);
+        let port_mappings = pod_cfg
+            .port_mappings
+            .into_iter()
+            .map(decode_port_mapping)
+            .collect();
+        let host_network = decode_host_network(&pod_cfg.linux);
+        let hostname = pod_cfg.hostname;
+
         let cfg = SandboxConfig {
             name: meta.name,
             uid: meta.uid,
@@ -340,10 +488,10 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
             labels: pod_cfg.labels.into_iter().collect(),
             annotations: pod_cfg.annotations.into_iter().collect(),
             log_directory: pod_cfg.log_directory,
-            hostname: String::new(), // WP-D wires these (build-spec-r1 §3)
-            host_network: false,     // WP-D wires these (build-spec-r1 §3)
-            dns: None,               // WP-D wires these (build-spec-r1 §3)
-            port_mappings: vec![],   // WP-D wires these (build-spec-r1 §3)
+            hostname,
+            host_network,
+            dns,
+            port_mappings,
         };
         let backend = Arc::clone(&self.backend);
         let id = tokio::task::spawn_blocking(move || backend.run_sandbox(cfg))
@@ -392,6 +540,7 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
             .await
             .map_err(|e| Status::internal(format!("spawn_blocking join error: {e}")))?
             .map_err(crate::map_err)?;
+        // v1.1: network.ip from SandboxStatus.ip
         let status = build_sandbox_status(&s);
         Ok(Response::new(proto::PodSandboxStatusResponse {
             status: Some(status),
@@ -430,6 +579,11 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
             .metadata
             .ok_or_else(|| Status::invalid_argument("config.metadata is required"))?;
         let image_ref = cfg_proto.image.map(|i| i.image).unwrap_or_default();
+
+        // v1.1 decode: tty/stdin from ContainerConfig
+        let tty = cfg_proto.tty;
+        let stdin = cfg_proto.stdin;
+
         let cfg = ContainerConfig {
             name: meta.name,
             attempt: meta.attempt,
@@ -454,8 +608,8 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
             labels: cfg_proto.labels.into_iter().collect(),
             annotations: cfg_proto.annotations.into_iter().collect(),
             log_path: cfg_proto.log_path,
-            tty: false,   // WP-D wires these (build-spec-r1 §3)
-            stdin: false, // WP-D wires these (build-spec-r1 §3)
+            tty,
+            stdin,
         };
         let backend = Arc::clone(&self.backend);
         let id = tokio::task::spawn_blocking(move || backend.create_container(&sandbox_id, cfg))
@@ -616,29 +770,84 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
         }))
     }
 
-    // ── R1 unimplemented ──────────────────────────────────────────────────────
-
+    /// Exec: validate container is Running, mint a token, return absolute URL.
+    /// The stream server dials `backend.open_exec` when the kubelet connects.
     async fn exec(
         &self,
-        _request: Request<proto::ExecRequest>,
+        request: Request<proto::ExecRequest>,
     ) -> Result<Response<proto::ExecResponse>, Status> {
-        Err(Status::unimplemented("Exec: R1 — see whitepaper §11"))
+        let req = request.into_inner();
+        let id = ContainerId(req.container_id.clone());
+
+        // Validate: container must exist and be Running.
+        let backend = Arc::clone(&self.backend);
+        let id2 = id.clone();
+        validate_container_running(backend, id2).await?;
+
+        let params = StreamParams {
+            container: Some(req.container_id),
+            sandbox: None,
+            cmd: req.cmd,
+            tty: req.tty,
+            stdin: req.stdin,
+            ports: vec![],
+            dial_target: None,
+        };
+        let url = self.mint_url(StreamVerb::Exec, params)?;
+        Ok(Response::new(proto::ExecResponse { url }))
     }
 
+    /// Attach: validate container is Running, mint a token, return absolute URL.
     async fn attach(
         &self,
-        _request: Request<proto::AttachRequest>,
+        request: Request<proto::AttachRequest>,
     ) -> Result<Response<proto::AttachResponse>, Status> {
-        Err(Status::unimplemented("Attach: R1 — see whitepaper §11"))
+        let req = request.into_inner();
+        let id = ContainerId(req.container_id.clone());
+
+        // Validate: container must exist and be Running.
+        let backend = Arc::clone(&self.backend);
+        let id2 = id.clone();
+        validate_container_running(backend, id2).await?;
+
+        let params = StreamParams {
+            container: Some(req.container_id),
+            sandbox: None,
+            cmd: vec![],
+            tty: req.tty,
+            stdin: req.stdin,
+            ports: vec![],
+            dial_target: None,
+        };
+        let url = self.mint_url(StreamVerb::Attach, params)?;
+        Ok(Response::new(proto::AttachResponse { url }))
     }
 
+    /// PortForward: validate sandbox exists and is Ready, resolve dial_target
+    /// (sandbox IP if present, else 127.0.0.1 for host_network), mint a token.
     async fn port_forward(
         &self,
-        _request: Request<proto::PortForwardRequest>,
+        request: Request<proto::PortForwardRequest>,
     ) -> Result<Response<proto::PortForwardResponse>, Status> {
-        Err(Status::unimplemented(
-            "PortForward: R1 — see whitepaper §11",
-        ))
+        let req = request.into_inner();
+        let id = SandboxId(req.pod_sandbox_id.clone());
+
+        // Validate: sandbox must exist and be Ready. Also read the sandbox ip.
+        let backend = Arc::clone(&self.backend);
+        let id2 = id.clone();
+        let dial_target: String = validate_sandbox_ready_get_ip(backend, id2).await?;
+
+        let params = StreamParams {
+            container: None,
+            sandbox: Some(req.pod_sandbox_id),
+            cmd: vec![],
+            tty: false,
+            stdin: false,
+            ports: req.port,
+            dial_target: Some(dial_target),
+        };
+        let url = self.mint_url(StreamVerb::PortForward, params)?;
+        Ok(Response::new(proto::PortForwardResponse { url }))
     }
 
     type GetContainerEventsStream = GetContainerEventsStream;
@@ -648,16 +857,18 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
         _request: Request<proto::GetEventsRequest>,
     ) -> Result<Response<Self::GetContainerEventsStream>, Status> {
         Err(Status::unimplemented(
-            "GetContainerEvents: R1 — see whitepaper §11",
+            "GetContainerEvents: R2 — descoped (kubelet 1.33 never calls; alpha gate off)",
         ))
     }
 
+    /// RuntimeConfig: literal UNIMPLEMENTED — kubelet 1.33 never calls this
+    /// (alpha gate off; r1-kubelet-smoke.md law). Do NOT implement.
     async fn update_runtime_config(
         &self,
         _request: Request<proto::UpdateRuntimeConfigRequest>,
     ) -> Result<Response<proto::UpdateRuntimeConfigResponse>, Status> {
         Err(Status::unimplemented(
-            "UpdateRuntimeConfig: R1 — see whitepaper §11",
+            "UpdateRuntimeConfig: not implemented (kubelet 1.33 never calls)",
         ))
     }
 
@@ -666,7 +877,7 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
         _request: Request<proto::UpdateContainerResourcesRequest>,
     ) -> Result<Response<proto::UpdateContainerResourcesResponse>, Status> {
         Err(Status::unimplemented(
-            "UpdateContainerResources: R1 — see whitepaper §11",
+            "UpdateContainerResources: R2 — see whitepaper §11",
         ))
     }
 
@@ -675,7 +886,7 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
         _request: Request<proto::ReopenContainerLogRequest>,
     ) -> Result<Response<proto::ReopenContainerLogResponse>, Status> {
         Err(Status::unimplemented(
-            "ReopenContainerLog: R1 — see whitepaper §11",
+            "ReopenContainerLog: R2 — see whitepaper §11",
         ))
     }
 
@@ -684,7 +895,7 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
         _request: Request<proto::CheckpointContainerRequest>,
     ) -> Result<Response<proto::CheckpointContainerResponse>, Status> {
         Err(Status::unimplemented(
-            "CheckpointContainer: R1 — see whitepaper §11",
+            "CheckpointContainer: R2 — see whitepaper §11",
         ))
     }
 
@@ -693,7 +904,7 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
         _request: Request<proto::PodSandboxStatsRequest>,
     ) -> Result<Response<proto::PodSandboxStatsResponse>, Status> {
         Err(Status::unimplemented(
-            "PodSandboxStats: R1 — see whitepaper §11",
+            "PodSandboxStats: R2 — descoped (kubelet 1.33 never calls; alpha gate off)",
         ))
     }
 
@@ -702,7 +913,7 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
         _request: Request<proto::ListPodSandboxStatsRequest>,
     ) -> Result<Response<proto::ListPodSandboxStatsResponse>, Status> {
         Err(Status::unimplemented(
-            "ListPodSandboxStats: R1 — see whitepaper §11",
+            "ListPodSandboxStats: R2 — descoped (kubelet 1.33 never calls; alpha gate off)",
         ))
     }
 
@@ -711,7 +922,7 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
         _request: Request<proto::ListMetricDescriptorsRequest>,
     ) -> Result<Response<proto::ListMetricDescriptorsResponse>, Status> {
         Err(Status::unimplemented(
-            "ListMetricDescriptors: R1 — see whitepaper §11",
+            "ListMetricDescriptors: R2 — see whitepaper §11",
         ))
     }
 
@@ -720,16 +931,18 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
         _request: Request<proto::ListPodSandboxMetricsRequest>,
     ) -> Result<Response<proto::ListPodSandboxMetricsResponse>, Status> {
         Err(Status::unimplemented(
-            "ListPodSandboxMetrics: R1 — see whitepaper §11",
+            "ListPodSandboxMetrics: R2 — see whitepaper §11",
         ))
     }
 
+    /// RuntimeConfig: literal UNIMPLEMENTED — kubelet 1.33 never calls this
+    /// (alpha gate off; r1-kubelet-smoke.md law). Do NOT implement.
     async fn runtime_config(
         &self,
         _request: Request<proto::RuntimeConfigRequest>,
     ) -> Result<Response<proto::RuntimeConfigResponse>, Status> {
         Err(Status::unimplemented(
-            "RuntimeConfig: R1 — see whitepaper §11",
+            "RuntimeConfig: not implemented (kubelet 1.33 never calls; alpha gate off)",
         ))
     }
 
@@ -738,12 +951,12 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
         _request: Request<proto::UpdatePodSandboxResourcesRequest>,
     ) -> Result<Response<proto::UpdatePodSandboxResourcesResponse>, Status> {
         Err(Status::unimplemented(
-            "UpdatePodSandboxResources: R1 — see whitepaper §11",
+            "UpdatePodSandboxResources: R2 — see whitepaper §11",
         ))
     }
 }
 
-// ── Unit tests for pure mapping helpers ──────────────────────────────────────
+// ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -869,5 +1082,221 @@ mod tests {
         assert_eq!(f.sandbox, Some(SandboxId("sandbox-1".to_string())));
         assert_eq!(f.id, None);
         assert_eq!(f.state, None);
+    }
+
+    // ── v1.1 decode helpers ───────────────────────────────────────────────────
+
+    #[test]
+    fn decode_dns_none() {
+        assert!(decode_dns(None).is_none());
+    }
+
+    #[test]
+    fn decode_dns_some() {
+        let d = proto::DnsConfig {
+            servers: vec!["8.8.8.8".to_string()],
+            searches: vec!["cluster.local".to_string()],
+            options: vec!["ndots:5".to_string()],
+        };
+        let result = decode_dns(Some(d)).unwrap();
+        assert_eq!(result.servers, vec!["8.8.8.8"]);
+        assert_eq!(result.searches, vec!["cluster.local"]);
+        assert_eq!(result.options, vec!["ndots:5"]);
+    }
+
+    #[test]
+    fn decode_port_mapping_tcp() {
+        let pm = proto::PortMapping {
+            protocol: proto::Protocol::Tcp as i32,
+            container_port: 80,
+            host_port: 8080,
+            host_ip: "0.0.0.0".to_string(),
+        };
+        let result = decode_port_mapping(pm);
+        assert_eq!(result.protocol, Protocol::Tcp);
+        assert_eq!(result.container_port, 80);
+        assert_eq!(result.host_port, 8080);
+        assert_eq!(result.host_ip, "0.0.0.0");
+    }
+
+    #[test]
+    fn decode_port_mapping_udp() {
+        let pm = proto::PortMapping {
+            protocol: proto::Protocol::Udp as i32,
+            container_port: 53,
+            host_port: 53,
+            host_ip: String::new(),
+        };
+        let result = decode_port_mapping(pm);
+        assert_eq!(result.protocol, Protocol::Udp);
+    }
+
+    #[test]
+    fn decode_port_mapping_sctp() {
+        let pm = proto::PortMapping {
+            protocol: proto::Protocol::Sctp as i32,
+            container_port: 9999,
+            host_port: 9999,
+            host_ip: String::new(),
+        };
+        let result = decode_port_mapping(pm);
+        assert_eq!(result.protocol, Protocol::Sctp);
+    }
+
+    #[test]
+    fn decode_host_network_node_mode() {
+        let linux = Some(proto::LinuxPodSandboxConfig {
+            cgroup_parent: String::new(),
+            security_context: Some(proto::LinuxSandboxSecurityContext {
+                namespace_options: Some(proto::NamespaceOption {
+                    network: proto::NamespaceMode::Node as i32,
+                    pid: proto::NamespaceMode::Pod as i32,
+                    ipc: proto::NamespaceMode::Pod as i32,
+                    target_id: String::new(),
+                    userns_options: None,
+                }),
+                ..Default::default()
+            }),
+            sysctls: std::collections::HashMap::new(),
+            overhead: None,
+            resources: None,
+        });
+        assert!(decode_host_network(&linux));
+    }
+
+    #[test]
+    fn decode_host_network_pod_mode() {
+        let linux = Some(proto::LinuxPodSandboxConfig {
+            cgroup_parent: String::new(),
+            security_context: Some(proto::LinuxSandboxSecurityContext {
+                namespace_options: Some(proto::NamespaceOption {
+                    network: proto::NamespaceMode::Pod as i32,
+                    pid: proto::NamespaceMode::Pod as i32,
+                    ipc: proto::NamespaceMode::Pod as i32,
+                    target_id: String::new(),
+                    userns_options: None,
+                }),
+                ..Default::default()
+            }),
+            sysctls: std::collections::HashMap::new(),
+            overhead: None,
+            resources: None,
+        });
+        assert!(!decode_host_network(&linux));
+    }
+
+    #[test]
+    fn decode_host_network_none() {
+        assert!(!decode_host_network(&None));
+    }
+
+    #[test]
+    fn sandbox_status_network_ip_populated() {
+        let ss = lightr_cri_backend::SandboxStatus {
+            id: SandboxId("sb-1".to_string()),
+            config: lightr_cri_backend::SandboxConfig {
+                name: "test".to_string(),
+                uid: "uid".to_string(),
+                namespace: "default".to_string(),
+                attempt: 0,
+                labels: Default::default(),
+                annotations: Default::default(),
+                log_directory: String::new(),
+                hostname: String::new(),
+                host_network: false,
+                dns: None,
+                port_mappings: vec![],
+            },
+            state: SandboxState::Ready,
+            created_at_nanos: 0,
+            ip: Some("10.0.0.5".to_string()),
+            netns_path: None,
+        };
+        let proto_status = build_sandbox_status(&ss);
+        let net = proto_status.network.unwrap();
+        assert_eq!(net.ip, "10.0.0.5");
+    }
+
+    #[test]
+    fn sandbox_status_network_ip_none_gives_empty() {
+        let ss = lightr_cri_backend::SandboxStatus {
+            id: SandboxId("sb-2".to_string()),
+            config: lightr_cri_backend::SandboxConfig {
+                name: "test".to_string(),
+                uid: "uid".to_string(),
+                namespace: "default".to_string(),
+                attempt: 0,
+                labels: Default::default(),
+                annotations: Default::default(),
+                log_directory: String::new(),
+                hostname: String::new(),
+                host_network: true,
+                dns: None,
+                port_mappings: vec![],
+            },
+            state: SandboxState::Ready,
+            created_at_nanos: 0,
+            ip: None,
+            netns_path: None,
+        };
+        let proto_status = build_sandbox_status(&ss);
+        let net = proto_status.network.unwrap();
+        assert_eq!(net.ip, "");
+    }
+
+    // ── Token/URL minting ─────────────────────────────────────────────────────
+
+    #[test]
+    fn mint_url_exec_format() {
+        let registry = Arc::new(TokenRegistry::new());
+        let shell: RuntimeShell<lightr_cri_fake::FakeBackend> = {
+            // We can't call new() without a valid state dir — use the internals directly.
+            let state = tempfile::tempdir().unwrap();
+            let backend = Arc::new(lightr_cri_fake::FakeBackend::open(state.path()).unwrap());
+            RuntimeShell {
+                backend,
+                registry: Arc::clone(&registry),
+                base_url: "http://127.0.0.1:12345".to_string(),
+            }
+        };
+        let params = StreamParams {
+            container: Some("ct-1".to_string()),
+            sandbox: None,
+            cmd: vec!["sh".to_string()],
+            tty: true,
+            stdin: true,
+            ports: vec![],
+            dial_target: None,
+        };
+        let url = shell.mint_url(StreamVerb::Exec, params).unwrap();
+        assert!(url.starts_with("http://127.0.0.1:12345/exec/"), "url={url}");
+        // token is 8 chars
+        let token = url.split('/').next_back().unwrap();
+        assert_eq!(token.len(), 8, "token={token}");
+    }
+
+    #[test]
+    fn mint_url_portforward_format() {
+        let state = tempfile::tempdir().unwrap();
+        let backend = Arc::new(lightr_cri_fake::FakeBackend::open(state.path()).unwrap());
+        let shell: RuntimeShell<lightr_cri_fake::FakeBackend> = RuntimeShell {
+            backend,
+            registry: Arc::new(TokenRegistry::new()),
+            base_url: "http://127.0.0.1:9876".to_string(),
+        };
+        let params = StreamParams {
+            container: None,
+            sandbox: Some("sb-1".to_string()),
+            cmd: vec![],
+            tty: false,
+            stdin: false,
+            ports: vec![80],
+            dial_target: Some("10.0.0.5".to_string()),
+        };
+        let url = shell.mint_url(StreamVerb::PortForward, params).unwrap();
+        assert!(
+            url.starts_with("http://127.0.0.1:9876/portforward/"),
+            "url={url}"
+        );
     }
 }
