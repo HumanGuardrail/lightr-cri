@@ -7,9 +7,29 @@ publish = false
 
 [dependencies]
 lightr-cri-backend = { path = "../lightr-cri-backend" }
-tokio = { workspace = true }
-axum = { workspace = true }
-flate2 = { workspace = true }
+# tokio: workspace pins rt-multi-thread/net/signal/macros; WP-C also needs
+# io-util/fs/sync/time to bridge the sync StreamSession Files to async and to
+# enforce token TTLs. These are tokio features, not new crates of record.
+tokio = { workspace = true, features = ["io-util", "fs", "sync", "time"] }
+# axum "ws" is the documented WebSocket path (build-spec-r1 §2: "tokio-tungstenite
+# 0.24 (or axum's ws)"). Enabling it pulls tokio-tungstenite 0.24 transitively.
+axum = { workspace = true, features = ["ws"] }
+# flate2 with the pure-Rust zlib-rs backend ADDED: the default miniz_oxide
+# backend does NOT expose set_dictionary, which the SPDY/3.1 header
+# (de)compression REQUIRES (build-spec-r1 §3 WP-C: "flate2 1 (SPDY zlib
+# dictionary)"). zlib-rs provides set_dictionary and takes precedence for that
+# API; it is a flate2 backend feature (no C toolchain, no new crate of record).
+# We do NOT set default-features=false (the workspace pin keeps defaults; the
+# member cannot override that without a cargo note), so both backends are
+# present — harmless, zlib-rs serves the dictionary path.
+flate2 = { workspace = true, features = ["zlib-rs"] }
 httparse = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# hyper/hyper-util: already in the lockfile via axum's "ws" feature. Named
+# directly ONLY to take over the upgraded connection for the SPDY/3.1 path
+# (hyper::upgrade::on → Upgraded; TokioIo bridges it to tokio I/O). axum has no
+# public SPDY-upgrade seam, and SPDY is mandatory (critest is SPDY-only). These
+# pin to the lockfile versions axum already selected — no new versions enter.
+hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
