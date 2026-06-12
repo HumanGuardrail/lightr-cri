@@ -1467,40 +1467,21 @@ impl CriBackend for FakeBackend {
                 waiter: Box::new(AttachWaiter),
             })
         } else {
-            // pipe mode: dup the held read-ends
-            let stdout = entry
-                .stdout_rd
-                .as_ref()
-                .map(dup_file)
-                .transpose()
-                .map_err(BackendError::Io)?;
-            let stderr = entry
-                .stderr_rd
-                .as_ref()
-                .map(dup_file)
-                .transpose()
-                .map_err(BackendError::Io)?;
-            let stdin_file = entry
-                .stdin_wr
-                .as_ref()
-                .map(dup_file)
-                .transpose()
-                .map_err(BackendError::Io)?;
-
-            struct AttachWaiter;
-            impl ExitWaiter for AttachWaiter {
-                fn wait(self: Box<Self>) -> Result<i32> {
-                    Ok(0)
-                }
-            }
-
-            Ok(StreamSession {
-                stdin: stdin_file,
-                stdout,
-                stderr,
-                pty_master: None,
-                waiter: Box::new(AttachWaiter),
-            })
+            // pipe mode (non-tty): the tee thread is the SOLE reader of the
+            // process read-ends (it writes the CRI log). Handing a dup of those
+            // read-ends to an attacher would make the two compete for bytes —
+            // each getting a random subset (cold-critic finding 2026-06-12).
+            // Correctly supporting pipe-mode attach needs an output fan-out
+            // (broadcast tee → log + N attachers), which is R2 work. Until then
+            // we return an honest error rather than a silently-wrong stream.
+            // (tty-mode attach above works: the pty master is duplicated by the
+            // kernel without this race, which is the kubectl-interactive case.)
+            let _ = (&entry.stdout_rd, &entry.stderr_rd, &entry.stdin_wr);
+            Err(BackendError::Internal(
+                "pipe-mode (non-tty) attach not supported (would race the log tee); \
+                 use a tty container or exec — R2: output fan-out"
+                    .to_string(),
+            ))
         }
     }
 
