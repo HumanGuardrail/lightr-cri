@@ -8,6 +8,11 @@ publish = false
 [dependencies]
 lightr-cri-proto = { path = "../lightr-cri-proto" }
 lightr-cri-backend = { path = "../lightr-cri-backend" }
+lightr-cri-stream = { path = "../lightr-cri-stream" }
 tonic = { workspace = true }
 prost = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+lightr-cri-fake = { path = "../lightr-cri-fake" }
+tempfile = { workspace = true }

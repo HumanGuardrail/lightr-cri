@@ -708,6 +708,7 @@ dependencies = [
  "lightr-cri-fake",
  "lightr-cri-proto",
  "lightr-cri-shell",
+ "lightr-cri-stream",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -718,8 +719,11 @@ name = "lightr-cri-shell"
 version = "0.1.0"
 dependencies = [
  "lightr-cri-backend",
+ "lightr-cri-fake",
  "lightr-cri-proto",
+ "lightr-cri-stream",
  "prost",
+ "tempfile",
  "tokio",
  "tonic",
 ]
