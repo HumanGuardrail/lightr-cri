@@ -62,7 +62,7 @@ fn create_on_thread(path: &Path) -> io::Result<()> {
         MsFlags::MS_BIND,
         None::<&str>,
     )
-    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("bind-mount netns: {e}")))?;
+    .map_err(|e| io::Error::other(format!("bind-mount netns: {e}")))?;
 
     Ok(())
 }
@@ -88,7 +88,7 @@ pub fn teardown(path: &Path) -> io::Result<()> {
 fn umount_detach(path: &Path) -> io::Result<()> {
     use nix::mount::{umount2, MntFlags};
     umount2(path, MntFlags::MNT_DETACH)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("umount2: {e}")))
+        .map_err(|e| io::Error::other(format!("umount2: {e}")))
 }
 
 #[cfg(not(target_os = "linux"))]
