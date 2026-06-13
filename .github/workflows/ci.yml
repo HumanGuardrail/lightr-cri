@@ -92,6 +92,18 @@ jobs:
           crictl --version
           critest --version
 
+      - name: install iptables + iproute2 (CNI bridge/portmap NAT + netns)
+        run: |
+          set -euo pipefail
+          # The bridge plugin (ipMasq) and portmap need iptables for NAT;
+          # iproute2 for veth/netns tooling. rust:1.96-bookworm ships neither.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq iptables iproute2
+          # CNI plugins exec iptables via $PATH; ensure /usr/sbin is on it for
+          # the server + test steps (Actions step PATH can be restricted).
+          echo "/usr/sbin" >> "$GITHUB_PATH"
+          PATH="/usr/sbin:$PATH" command -v iptables
+
       - name: install CNI plugins v1.9.1 and kubelet v1.33.13 (pinned sha256)
         run: |
           set -euo pipefail
