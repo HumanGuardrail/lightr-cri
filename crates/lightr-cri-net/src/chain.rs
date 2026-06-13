@@ -187,10 +187,20 @@ pub fn derive_plugin_config(
         .unwrap_or(false);
 
     if has_portmappings_cap && !port_mappings.is_empty() {
-        let pm_values: Vec<Value> = port_mappings.iter().map(serialize_port_mapping).collect();
-        let mut runtime_cfg = serde_json::Map::new();
-        runtime_cfg.insert("portMappings".to_string(), Value::Array(pm_values));
-        obj.insert("runtimeConfig".to_string(), Value::Object(runtime_cfg));
+        // CRI spec: host_port == 0 means "no host mapping" — omit those entries.
+        // Passing host_port=0 to the portmap CNI plugin produces:
+        //   "CNI ADD: portmap: Invalid host port number: 0"
+        // (observed in critest v1.33 conformance run).
+        let pm_values: Vec<Value> = port_mappings
+            .iter()
+            .filter(|pm| pm.host_port > 0)
+            .map(serialize_port_mapping)
+            .collect();
+        if !pm_values.is_empty() {
+            let mut runtime_cfg = serde_json::Map::new();
+            runtime_cfg.insert("portMappings".to_string(), Value::Array(pm_values));
+            obj.insert("runtimeConfig".to_string(), Value::Object(runtime_cfg));
+        }
     }
 
     serde_json::to_string(&Value::Object(obj)).unwrap_or_else(|_| "{}".to_string())
@@ -404,6 +414,54 @@ mod tests {
         assert_eq!(first["hostPort"], 12000);
         assert_eq!(first["containerPort"], 80);
         assert_eq!(first["protocol"], "tcp");
+    }
+
+    /// host_port == 0 means "no host mapping" per CRI spec — must be omitted
+    /// from the portmap runtimeConfig to avoid "Invalid host port number: 0".
+    #[test]
+    fn derive_portmap_omits_host_port_zero() {
+        use lightr_cri_backend::{PortMapping, Protocol};
+        let plugin = json!({"type": "portmap", "capabilities": {"portMappings": true}});
+        // Mix: one mapping with host_port=0 (omit), one with host_port=8080 (keep).
+        let pm_zero = PortMapping {
+            protocol: Protocol::Tcp,
+            container_port: 80,
+            host_port: 0,
+            host_ip: "".to_string(),
+        };
+        let pm_real = PortMapping {
+            protocol: Protocol::Tcp,
+            container_port: 443,
+            host_port: 8443,
+            host_ip: "".to_string(),
+        };
+        let out = derive_plugin_config(&plugin, "1.0.0", "net", None, &[pm_zero, pm_real]);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let pmaps = v["runtimeConfig"]["portMappings"].as_array().unwrap();
+        // Only the real mapping must appear.
+        assert_eq!(pmaps.len(), 1, "host_port=0 must be filtered out");
+        assert_eq!(pmaps[0]["hostPort"], 8443);
+        assert_eq!(pmaps[0]["containerPort"], 443);
+    }
+
+    /// When ALL port mappings have host_port == 0, runtimeConfig must be absent
+    /// (no empty portMappings array).
+    #[test]
+    fn derive_portmap_all_zero_omits_runtime_config() {
+        use lightr_cri_backend::{PortMapping, Protocol};
+        let plugin = json!({"type": "portmap", "capabilities": {"portMappings": true}});
+        let pm_zero = PortMapping {
+            protocol: Protocol::Tcp,
+            container_port: 80,
+            host_port: 0,
+            host_ip: "".to_string(),
+        };
+        let out = derive_plugin_config(&plugin, "1.0.0", "net", None, &[pm_zero]);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            v.get("runtimeConfig").is_none(),
+            "runtimeConfig must be absent when all host_ports are 0"
+        );
     }
 
     #[test]

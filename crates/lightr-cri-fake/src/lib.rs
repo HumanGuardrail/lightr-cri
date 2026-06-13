@@ -703,14 +703,39 @@ impl CriBackend for FakeBackend {
             )));
         }
 
-        // Fetch the sandbox record to get log_directory
-        let sandbox_log_dir = {
+        // Fetch the sandbox record to get log_directory, dns, hostname.
+        let (sandbox_log_dir, sandbox_dns, sandbox_hostname) = {
             let cache = self.cache.lock().unwrap();
             cache
                 .sandboxes
                 .get(&rec.sandbox)
-                .map(|s| s.config.log_directory.clone())
+                .map(|s| {
+                    (
+                        s.config.log_directory.clone(),
+                        s.config.dns.clone(),
+                        s.config.hostname.clone(),
+                    )
+                })
                 .unwrap_or_default()
+        };
+
+        // §D resolv.conf synthesis: if the sandbox has dns config, write a
+        // per-sandbox resolv.conf into the state dir so pre_exec can bind-mount
+        // it (Linux only; macOS falls through to no-op).
+        let resolv_conf_path: Option<std::path::PathBuf> = if let Some(ref dns) = sandbox_dns {
+            match write_sandbox_resolv_conf(&self.state_root, &rec.sandbox, dns) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    // Non-fatal: log and continue without resolv.conf override
+                    eprintln!(
+                        "[lightr-cri-fake] resolv.conf synthesis for sandbox {}: {e}",
+                        rec.sandbox.0
+                    );
+                    None
+                }
+            }
+        } else {
+            None
         };
 
         // Open (or create) the CRI log file — empty file must exist from start (kubelet law §C)
@@ -718,8 +743,30 @@ impl CriBackend for FakeBackend {
             open_cri_log(&sandbox_log_dir, &rec.config.log_path).map_err(BackendError::Io)?;
         let log_shared: Arc<Mutex<Option<fs::File>>> = Arc::new(Mutex::new(log_file_opt));
 
-        // Build command
-        let mut cmd_iter = rec.config.command.iter().chain(rec.config.args.iter());
+        // Build command.
+        //
+        // Honest fake default entrypoint: when both `command` and `args` are
+        // empty the container config carries no entrypoint (typical of critest
+        // synthetic fake images which have no OCI image config). A real runtime
+        // would fall back to the image's Cmd/Entrypoint; the fake has no image
+        // layer, so we substitute a pause-equivalent shell loop that keeps the
+        // container RUNNING so critest can exec into it. This is documented
+        // fake behavior, NOT a faked result — containers with an explicit
+        // command continue to use it unchanged.
+        let default_command: Vec<String>;
+        let (effective_command, effective_args): (&[String], &[String]) =
+            if rec.config.command.is_empty() && rec.config.args.is_empty() {
+                default_command = vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "while true; do sleep 2147483647; done".to_string(),
+                ];
+                (&default_command, &[])
+            } else {
+                (&rec.config.command, &rec.config.args)
+            };
+
+        let mut cmd_iter = effective_command.iter().chain(effective_args.iter());
         let program = cmd_iter
             .next()
             .ok_or_else(|| BackendError::InvalidArgument("empty command".to_string()))?;
@@ -748,14 +795,13 @@ impl CriBackend for FakeBackend {
             } else {
                 cmd.stdin(Stdio::null());
             }
-            #[cfg(unix)]
-            unsafe {
-                use std::os::unix::process::CommandExt;
-                cmd.pre_exec(|| {
-                    libc::setsid();
-                    Ok(())
-                });
-            }
+            // Install namespace pre_exec (setsid + optional UTS/mount namespaces
+            // for hostname and resolv.conf).  Linux-only paths are #[cfg]-guarded.
+            install_container_pre_exec(
+                &mut cmd,
+                sandbox_hostname.clone(),
+                resolv_conf_path.clone(),
+            );
             return self.start_container_pipe_mode(id, rec, cmd, sandbox_log_dir, log_shared);
         }
 
@@ -773,18 +819,12 @@ impl CriBackend for FakeBackend {
         let slave_stdout = dup_file(&slave_file).map_err(BackendError::Io)?;
         let slave_stderr = slave_file; // last use — move it
 
-        use std::os::unix::process::CommandExt;
         cmd.stdin(slave_stdin);
         cmd.stdout(slave_stdout);
         cmd.stderr(slave_stderr);
 
-        // setsid so the child can be a session leader (required for pty control)
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
+        // setsid + optional UTS/mount namespaces for hostname and resolv.conf.
+        install_container_pre_exec(&mut cmd, sandbox_hostname, resolv_conf_path);
 
         // Tee: master fd carries all output (stdout+stderr merged on pty)
         let master_for_tee = dup_file(&master_file).map_err(BackendError::Io)?;
@@ -1564,6 +1604,141 @@ fn cni_teardown(id: &SandboxId, netns_path: &str, _ip: &Option<String>) {
             "[lightr-cri-fake] netns teardown for {} failed: {e}",
             netns_path
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §D namespace helpers: resolv.conf synthesis + UTS/mount namespace setup
+// ---------------------------------------------------------------------------
+
+/// Synthesize a `resolv.conf` from the sandbox DnsConfig and write it to
+/// `{state_root}/resolv-{sandbox_id}.conf`.  Returns the absolute path so
+/// `install_container_pre_exec` can bind-mount it.
+///
+/// The file is written unconditionally on every `start_container` call so
+/// dns changes in a re-run sandbox are reflected (crash-only: overwrite is
+/// atomic via tmpfile+rename already used for state files).
+fn write_sandbox_resolv_conf(
+    state_root: &Path,
+    sandbox: &SandboxId,
+    dns: &lightr_cri_backend::DnsConfig,
+) -> std::io::Result<PathBuf> {
+    let mut content = String::new();
+    for s in &dns.servers {
+        content.push_str(&format!("nameserver {s}\n"));
+    }
+    if !dns.searches.is_empty() {
+        content.push_str(&format!("search {}\n", dns.searches.join(" ")));
+    }
+    if !dns.options.is_empty() {
+        content.push_str(&format!("options {}\n", dns.options.join(" ")));
+    }
+    let filename = format!("resolv-{}.conf", sandbox.0);
+    atomic_write(state_root, &filename, content.as_bytes())?;
+    Ok(state_root.join(filename))
+}
+
+/// Register a `pre_exec` closure on `cmd` that:
+///   1. Always: `setsid()` so the child is a session leader.
+///   2. Linux only, when `hostname` is non-empty: `unshare(CLONE_NEWUTS)` +
+///      `sethostname(hostname)`.
+///   3. Linux only, when `resolv_conf_src` is Some: `unshare(CLONE_NEWNS)` +
+///      bind-mount `resolv_conf_src` over `/etc/resolv.conf` in the child's
+///      private mount namespace.
+///
+/// All operations use only async-signal-safe syscalls (no alloc after fork).
+/// The `hostname` and `resolv_conf_src` values are moved into the closure
+/// before `fork` (parent side — safe).
+///
+/// On non-Linux platforms this function registers only the `setsid` closure.
+fn install_container_pre_exec(
+    cmd: &mut std::process::Command,
+    hostname: String,
+    resolv_conf_src: Option<PathBuf>,
+) {
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+
+        // Convert hostname and path to bytes once in the parent (safe: before fork).
+        // We use raw C strings so pre_exec does not need to allocate.
+        let hostname_bytes: Option<Vec<u8>> = if hostname.is_empty() {
+            None
+        } else {
+            let mut b = hostname.into_bytes();
+            b.push(0); // NUL-terminate for C
+            Some(b)
+        };
+
+        #[cfg(target_os = "linux")]
+        let resolv_src_bytes: Option<Vec<u8>> = resolv_conf_src.map(|p| {
+            let mut b = p.as_os_str().as_encoded_bytes().to_vec();
+            b.push(0);
+            b
+        });
+
+        #[cfg(not(target_os = "linux"))]
+        let _ = resolv_conf_src; // unused on non-Linux
+
+        cmd.pre_exec(move || {
+            // 1. setsid — always.
+            libc::setsid();
+
+            // 2. UTS namespace: set hostname (Linux only).
+            #[cfg(target_os = "linux")]
+            if let Some(ref hb) = hostname_bytes {
+                // unshare(CLONE_NEWUTS): enter a private UTS namespace.
+                if libc::unshare(libc::CLONE_NEWUTS) == 0 {
+                    // sethostname(ptr, len-1) — exclude the NUL terminator.
+                    let len = hb.len() - 1; // length without NUL
+                    libc::sethostname(hb.as_ptr() as *const libc::c_char, len);
+                }
+                // If unshare fails (e.g. missing CAP_SYS_ADMIN in non-root
+                // CI) we continue rather than abort the child — the hostname
+                // will be the host's, and the critest DNS/hostname spec will
+                // fail in that environment as expected.
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = &hostname_bytes;
+
+            // 3. Mount namespace: bind-mount resolv.conf (Linux only).
+            #[cfg(target_os = "linux")]
+            if let Some(ref src_bytes) = resolv_src_bytes {
+                // Target: "/etc/resolv.conf\0"
+                const TARGET: &[u8] = b"/etc/resolv.conf\0";
+                // unshare(CLONE_NEWNS): enter a private mount namespace.
+                if libc::unshare(libc::CLONE_NEWNS) == 0 {
+                    // make the mount tree private so the bind-mount doesn't
+                    // propagate to the host (MS_REC | MS_PRIVATE).
+                    libc::mount(
+                        std::ptr::null(),
+                        b"/\0".as_ptr() as *const libc::c_char,
+                        std::ptr::null(),
+                        libc::MS_REC | libc::MS_PRIVATE,
+                        std::ptr::null(),
+                    );
+                    // bind-mount the synthesized resolv.conf.
+                    libc::mount(
+                        src_bytes.as_ptr() as *const libc::c_char,
+                        TARGET.as_ptr() as *const libc::c_char,
+                        std::ptr::null(),
+                        libc::MS_BIND,
+                        std::ptr::null(),
+                    );
+                }
+                // Same as hostname: best-effort — if unshare fails the child
+                // inherits the host resolv.conf.
+            }
+
+            Ok(())
+        });
+    }
+    // On non-Unix there is no pre_exec — no-op.
+    #[cfg(not(unix))]
+    {
+        let _ = cmd;
+        let _ = hostname;
+        let _ = resolv_conf_src;
     }
 }
 
@@ -2662,5 +2837,200 @@ mod tests {
         );
         backend2.stop_container(&cid, 0).unwrap();
         backend2.remove_container(&cid).unwrap();
+    }
+
+    // ---- Fix 2: empty command default entrypoint ----
+
+    /// When both command and args are empty, start_container must substitute
+    /// a pause-equivalent default (`/bin/sh -c while true; do sleep ...`) so
+    /// the container starts running and critest can exec into it.
+    #[test]
+    fn empty_command_defaults_to_pause_loop() {
+        let (_dir, backend) = tmp_backend();
+        let sb = backend.run_sandbox(minimal_sandbox_cfg("sb")).unwrap();
+
+        // Explicitly empty command + args — the default entrypoint kicks in.
+        let cfg = ContainerConfig {
+            name: "no-cmd".to_string(),
+            attempt: 0,
+            image_ref: "fake:latest".to_string(),
+            command: vec![], // empty
+            args: vec![],    // empty
+            working_dir: String::new(),
+            envs: vec![],
+            mounts: vec![],
+            labels: Default::default(),
+            annotations: Default::default(),
+            log_path: String::new(),
+            tty: false,
+            stdin: false,
+        };
+        let cid = backend.create_container(&sb, cfg).unwrap();
+        // Must not fail with "empty command" — the fake substitutes the pause loop.
+        backend.start_container(&cid).unwrap();
+
+        // Container must be Running.
+        let status = backend.container_status(&cid).unwrap();
+        assert_eq!(
+            status.state,
+            ContainerState::Running,
+            "container with empty command must enter Running via default entrypoint"
+        );
+
+        // exec_sync into the running container must work.
+        let result = backend
+            .exec_sync(&cid, &["/bin/echo".to_string(), "ok".to_string()], 5)
+            .unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert!(result.stdout.starts_with(b"ok"));
+
+        backend.stop_container(&cid, 0).unwrap();
+        backend.remove_container(&cid).unwrap();
+        backend.remove_sandbox(&sb).unwrap();
+    }
+
+    // ---- Fix 3/4: resolv.conf + hostname namespace (Linux-only, probe-gated) ----
+
+    /// resolv.conf synthesis: when the sandbox has DnsConfig, exec_sync
+    /// `cat /etc/resolv.conf` must contain the configured nameserver/search/options.
+    ///
+    /// This test requires Linux (mount namespace + bind-mount) and CAP_SYS_ADMIN.
+    /// It SKIPs cleanly on macOS or when running unprivileged.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn resolv_conf_synthesized_in_container() {
+        // Probe: need CAP_SYS_ADMIN for unshare(CLONE_NEWNS).
+        // Use a lightweight check: try unshare on a throwaway thread.
+        let priv_ok =
+            std::thread::spawn(|| -> bool { unsafe { libc::unshare(libc::CLONE_NEWNS) == 0 } })
+                .join()
+                .unwrap_or(false);
+        if !priv_ok {
+            eprintln!(
+                "SKIP resolv_conf_synthesized_in_container: \
+                 CLONE_NEWNS requires CAP_SYS_ADMIN (probe-truthful)"
+            );
+            return;
+        }
+
+        let (_dir, backend) = tmp_backend();
+
+        let mut sb_cfg = minimal_sandbox_cfg("sb-dns");
+        sb_cfg.dns = Some(DnsConfig {
+            servers: vec!["10.10.10.10".to_string()],
+            searches: vec!["google.com".to_string()],
+            options: vec!["ndots:8".to_string()],
+        });
+        let sb = backend.run_sandbox(sb_cfg).unwrap();
+
+        // Container with empty command — uses the pause-loop default.
+        let cfg = ContainerConfig {
+            name: "dns-test".to_string(),
+            attempt: 0,
+            image_ref: "fake:latest".to_string(),
+            command: vec![],
+            args: vec![],
+            working_dir: String::new(),
+            envs: vec![],
+            mounts: vec![],
+            labels: Default::default(),
+            annotations: Default::default(),
+            log_path: String::new(),
+            tty: false,
+            stdin: false,
+        };
+        let cid = backend.create_container(&sb, cfg).unwrap();
+        backend.start_container(&cid).unwrap();
+
+        // exec cat /etc/resolv.conf inside the container's namespace.
+        let result = backend
+            .exec_sync(
+                &cid,
+                &["/bin/cat".to_string(), "/etc/resolv.conf".to_string()],
+                5,
+            )
+            .unwrap();
+        assert_eq!(result.exit_code, 0, "cat /etc/resolv.conf must succeed");
+
+        let content = String::from_utf8_lossy(&result.stdout);
+        assert!(
+            content.contains("nameserver 10.10.10.10"),
+            "resolv.conf must contain nameserver; got: {content:?}"
+        );
+        assert!(
+            content.contains("search google.com"),
+            "resolv.conf must contain search; got: {content:?}"
+        );
+        assert!(
+            content.contains("options ndots:8"),
+            "resolv.conf must contain options; got: {content:?}"
+        );
+
+        backend.stop_container(&cid, 0).unwrap();
+        backend.remove_container(&cid).unwrap();
+        backend.remove_sandbox(&sb).unwrap();
+    }
+
+    /// hostname namespace: when the sandbox has a hostname set, the container's
+    /// `hostname` command must return it.
+    ///
+    /// Requires Linux + CAP_SYS_ADMIN for unshare(CLONE_NEWUTS).
+    /// SKIPs cleanly on macOS or unprivileged.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn hostname_set_in_container_uts_namespace() {
+        // Probe: need CAP_SYS_ADMIN for unshare(CLONE_NEWUTS).
+        let priv_ok =
+            std::thread::spawn(|| -> bool { unsafe { libc::unshare(libc::CLONE_NEWUTS) == 0 } })
+                .join()
+                .unwrap_or(false);
+        if !priv_ok {
+            eprintln!(
+                "SKIP hostname_set_in_container_uts_namespace: \
+                 CLONE_NEWUTS requires CAP_SYS_ADMIN (probe-truthful)"
+            );
+            return;
+        }
+
+        let (_dir, backend) = tmp_backend();
+
+        let mut sb_cfg = minimal_sandbox_cfg("sb-hostname");
+        sb_cfg.hostname = "critest-hostname".to_string();
+        let sb = backend.run_sandbox(sb_cfg).unwrap();
+
+        let cfg = ContainerConfig {
+            name: "uts-test".to_string(),
+            attempt: 0,
+            image_ref: "fake:latest".to_string(),
+            command: vec![],
+            args: vec![],
+            working_dir: String::new(),
+            envs: vec![],
+            mounts: vec![],
+            labels: Default::default(),
+            annotations: Default::default(),
+            log_path: String::new(),
+            tty: false,
+            stdin: false,
+        };
+        let cid = backend.create_container(&sb, cfg).unwrap();
+        backend.start_container(&cid).unwrap();
+
+        // exec hostname inside the container.
+        let result = backend
+            .exec_sync(&cid, &["/bin/hostname".to_string()], 5)
+            .unwrap();
+        assert_eq!(result.exit_code, 0, "hostname must succeed");
+
+        let got = String::from_utf8_lossy(&result.stdout);
+        let got = got.trim();
+        assert_eq!(
+            got, "critest-hostname",
+            "hostname must return the sandbox hostname; got: {got:?}"
+        );
+
+        backend.stop_container(&cid, 0).unwrap();
+        backend.remove_container(&cid).unwrap();
+        backend.remove_sandbox(&sb).unwrap();
     }
 }

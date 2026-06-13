@@ -6,6 +6,7 @@
 #
 # R1 GRADED FAMILIES (removed from skip-list in WP-G R1):
 #   - Streaming (Exec/Attach/PortForward): WP-C/D implement SPDY+WS; graded R1.
+#     (streaming lines OWNED by the SPDY agent — do not add/remove here)
 #   - Networking (Network/CNI/PodNetwork/HostNetwork/DNS/PortMapping/Portforward):
 #       WP-B/D implement CNI bridge+host-local+portmap + netns lifecycle; graded R1.
 #   - Container log (CRI log format): WP-A implements log tee + CRI format; graded R1.
@@ -13,6 +14,21 @@
 #       image config; graded R1.
 # These families now surface as CANDIDATE items on the first green R1 linux run;
 # lead appends confirmed passes to tests/GREENLIST.
+#
+# CONFORMANCE FIXES APPLIED (2026-06-13, non-streaming):
+#   - empty command default entrypoint: FakeBackend substitutes pause-loop when
+#       container command+args are empty (fixes "failed to start container: invalid
+#       argument: empty command").
+#   - resolv.conf synthesis: sandbox DnsConfig → write per-sandbox resolv.conf;
+#       bind-mount over /etc/resolv.conf in CLONE_NEWNS pre_exec on Linux
+#       (fixes "DNS config" spec: cat /etc/resolv.conf assertions).
+#   - hostname UTS namespace: sandbox hostname → unshare(CLONE_NEWUTS)+sethostname
+#       in pre_exec on Linux (fixes "set hostname" spec).
+#   - portmap hostPort=0 omit: host_port==0 entries filtered from runtimeConfig
+#       portMappings before passing to CNI portmap plugin (fixes "Invalid host
+#       port number: 0").
+#   - critest_scoped: removed critest invocation from cargo test (was duplicating
+#       ci/critest-gate.sh and aborting workspace on failure).
 
 # RuntimeConfig / UpdateRuntimeConfig — UNIMPLEMENTED (literal code per
 # r1-kubelet-smoke.md law; any other code = kubelet startup fails). R2 N/A.

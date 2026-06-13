@@ -87,8 +87,7 @@ pub fn teardown(path: &Path) -> io::Result<()> {
 #[cfg(target_os = "linux")]
 fn umount_detach(path: &Path) -> io::Result<()> {
     use nix::mount::{umount2, MntFlags};
-    umount2(path, MntFlags::MNT_DETACH)
-        .map_err(|e| io::Error::other(format!("umount2: {e}")))
+    umount2(path, MntFlags::MNT_DETACH).map_err(|e| io::Error::other(format!("umount2: {e}")))
 }
 
 #[cfg(not(target_os = "linux"))]
