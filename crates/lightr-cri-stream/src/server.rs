@@ -20,6 +20,22 @@ use hyper_util::rt::TokioIo;
 use crate::{portforward, spdy, ws};
 use crate::{ServerHandle, SessionFactory, StreamParams, StreamVerb, TokenRegistry};
 
+/// Optional session-duration cap, gated by `LIGHTR_STREAM_MAX_SESSION_SECS`.
+/// Set ONLY in CI/critest as a safety net so a stuck streaming session can't hang
+/// the whole conformance suite. UNSET in production — exec/attach/port-forward are
+/// legitimately long-lived, so no cap is applied unless the env var is present.
+async fn with_session_cap<F: std::future::Future<Output = ()>>(fut: F) {
+    match std::env::var("LIGHTR_STREAM_MAX_SESSION_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        Some(secs) => {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await;
+        }
+        None => fut.await,
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     registry: Arc<TokenRegistry>,
@@ -115,7 +131,7 @@ async fn exec_attach(
         };
         return upgrade
             .on_upgrade(move |socket| async move {
-                ws::run_session(socket, proto_owned, verb, params, factory).await;
+                with_session_cap(ws::run_session(socket, proto_owned, verb, params, factory)).await;
             })
             .into_response();
     }
@@ -173,7 +189,7 @@ async fn portforward_handler(
         };
         return upgrade
             .on_upgrade(move |socket| async move {
-                portforward::run_ws(socket, ports, dial_host, netns_path).await;
+                with_session_cap(portforward::run_ws(socket, ports, dial_host, netns_path)).await;
             })
             .into_response();
     }
@@ -227,7 +243,7 @@ fn spdy_exec_upgrade(
     tokio::spawn(async move {
         if let Ok(upgraded) = on_upgrade.await {
             let io = TokioIo::new(upgraded);
-            spdy::conn::run_exec(io, verb, params, factory).await;
+            with_session_cap(spdy::conn::run_exec(io, verb, params, factory)).await;
         }
     });
 
@@ -254,7 +270,7 @@ fn spdy_portforward_upgrade(
     tokio::spawn(async move {
         if let Ok(upgraded) = on_upgrade.await {
             let io = TokioIo::new(upgraded);
-            spdy::conn::run_portforward(io, dial_host, netns_path).await;
+            with_session_cap(spdy::conn::run_portforward(io, dial_host, netns_path)).await;
         }
     });
 
