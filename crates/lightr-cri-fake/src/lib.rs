@@ -1215,6 +1215,17 @@ impl CriBackend for FakeBackend {
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
 
+        // Own process group so a timeout can SIGKILL the whole tree. critest's
+        // "execSync with timeout" wraps the command in a shell that forks a child
+        // (e.g. `sleep`); killing only the immediate child leaves the grandchild
+        // holding the stdout pipe, so the timeout read would block and exec_sync
+        // would never return. With the child as group leader, kill(-pgid) reaps all.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+
         // §D: join the container child's namespaces so the exec process sees the
         // container's synthesized /etc/resolv.conf (mnt) and hostname (uts), plus
         // the sandbox netns. Order: mnt + uts first, then net (registered last so
@@ -1277,8 +1288,16 @@ impl CriBackend for FakeBackend {
                     }
                     None => {
                         if std::time::Instant::now() >= deadline {
-                            // Kill on timeout
+                            // Timeout: SIGKILL the whole process group (the child is
+                            // its own group leader) so a forked grandchild can't keep
+                            // the stdout pipe open and wedge the call; then reap so no
+                            // zombie survives.
+                            #[cfg(unix)]
+                            unsafe {
+                                libc::kill(-(child.id() as i32), libc::SIGKILL);
+                            }
                             let _ = child.kill();
+                            let _ = child.wait();
                             return Err(BackendError::Internal("exec timeout".to_string()));
                         }
                         std::thread::sleep(std::time::Duration::from_millis(10));

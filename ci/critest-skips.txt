@@ -67,6 +67,12 @@
 # All 23 items failed in R0; none passed. Whole block safe to skip. R2.
 Security Context  # reason → R2
 
+# AppArmor — needs a real LSM/AppArmor enforcement engine (load + verify + reject
+# unloadable profiles); the fake has none, so the "should error on unloadable
+# profile" specs fail (expected error, got nil). Same class as Security Context.
+# Owner-authorized R2 (2026-06-19).
+AppArmor  # reason → R2
+
 # Container Mount Readonly — needs privileged mount support (tmpfs/bind-mount
 # syscalls require CAP_SYS_ADMIN; fake backend has no mount namespace). R2.
 should support non-recursive readonly mounts  # reason → R2
