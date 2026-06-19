@@ -9,7 +9,9 @@
 //! (stdin|stdout|stderr|error|resize) drive the `StreamSession`. The v4
 //! `metav1.Status` exit lands on the error stream.
 //! PortForward: stream PAIRS (`streamType` data|error, `port`, `requestID`)
-//! dial `dial_target:port` and pipe; RST both on dial failure.
+//! dial the backend and pipe; RST both on dial failure. The dial enters the
+//! sandbox netns when one is recorded (contract §B AMENDED 2026-06-19): see
+//! `dial_pf` — `setns` + connect on a dedicated thread, host-netns otherwise.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -452,7 +454,7 @@ where
 /// Drive a SPDY portforward session. Streams arrive in PAIRS keyed by
 /// `requestID`; the `data` stream carries bytes to/from the dialed TCP socket,
 /// the `error` stream carries plaintext failures. RST both on dial failure.
-pub async fn run_portforward<S>(stream: S, dial_host: String)
+pub async fn run_portforward<S>(stream: S, dial_host: String, netns_path: Option<String>)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -519,8 +521,10 @@ where
                     // default/"data" stream
                     entry.data_stream = Some(stream_id);
                     data_route.insert(stream_id, req_id.clone());
-                    // Dial now and start the TCP→SPDY pump.
-                    match TcpStream::connect((dial_host.as_str(), entry.port)).await {
+                    // Dial now and start the TCP→SPDY pump. When the sandbox
+                    // has a netns (contract §B AMENDED 2026-06-19) the connect
+                    // happens INSIDE the sandbox netns; otherwise host-netns.
+                    match dial_pf(dial_host.as_str(), entry.port, netns_path.as_deref()).await {
                         Ok(sock) => {
                             let (rd_half, wr_half) = sock.into_split();
                             entry.tcp = Some(Arc::new(Mutex::new(wr_half)));
@@ -591,6 +595,32 @@ where
         // stragglers so run_portforward cannot block indefinitely.
         for h in drain_abort {
             h.abort();
+        }
+    }
+}
+
+/// Dial `host:port` for a forwarded connection. With `netns_path = Some`, the
+/// connect runs INSIDE the sandbox network namespace (contract §B AMENDED
+/// 2026-06-19): `lightr_cri_net::netns::dial_in_netns` does the `setns` +
+/// blocking `std::net` connect on a DEDICATED thread (never a tokio worker —
+/// `setns` mutates the calling thread's netns), and hands the connected
+/// `std::TcpStream` back; we adopt it as a tokio stream off the async runtime
+/// via `spawn_blocking` so the cross-thread `join()` never parks a worker.
+/// `None` (host_network) keeps the ordinary host-netns dial unchanged.
+async fn dial_pf(host: &str, port: u16, netns_path: Option<&str>) -> std::io::Result<TcpStream> {
+    match netns_path {
+        None => TcpStream::connect((host, port)).await,
+        Some(ns) => {
+            let ns = ns.to_string();
+            let host = host.to_string();
+            // The dedicated dial thread blocks on .join(); run it off-runtime.
+            let std_sock = tokio::task::spawn_blocking(move || {
+                lightr_cri_net::netns::dial_in_netns(&ns, &host, port)
+            })
+            .await
+            .map_err(|e| std::io::Error::other(format!("dial_in_netns join: {e}")))??;
+            std_sock.set_nonblocking(true)?;
+            TcpStream::from_std(std_sock)
         }
     }
 }

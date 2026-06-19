@@ -138,13 +138,22 @@ async fn portforward_handler(
     }
 
     let headers = req.headers().clone();
-    let dial_host = params
-        .dial_target
-        .clone()
-        .unwrap_or_else(|| "127.0.0.1".to_string());
+    // Contract §B (AMENDED 2026-06-19): when the sandbox has a recorded netns
+    // path, the dial happens INSIDE that netns against 127.0.0.1; otherwise
+    // (host_network) the host-netns dial of `dial_target` is kept.
+    let netns_path = params.netns_path.clone();
+    let dial_host = if netns_path.is_some() {
+        // In-netns dial targets the pod loopback regardless of the CNI IP.
+        "127.0.0.1".to_string()
+    } else {
+        params
+            .dial_target
+            .clone()
+            .unwrap_or_else(|| "127.0.0.1".to_string())
+    };
 
     if wants_spdy(&headers) {
-        return spdy_portforward_upgrade(req, dial_host);
+        return spdy_portforward_upgrade(req, dial_host, netns_path);
     }
 
     if let Some(ws) = ws {
@@ -164,7 +173,7 @@ async fn portforward_handler(
         };
         return upgrade
             .on_upgrade(move |socket| async move {
-                portforward::run_ws(socket, ports, dial_host).await;
+                portforward::run_ws(socket, ports, dial_host, netns_path).await;
             })
             .into_response();
     }
@@ -225,7 +234,11 @@ fn spdy_exec_upgrade(
     build_101_spdy(Some(negotiated))
 }
 
-fn spdy_portforward_upgrade(mut req: Request<Body>, dial_host: String) -> Response<Body> {
+fn spdy_portforward_upgrade(
+    mut req: Request<Body>,
+    dial_host: String,
+    netns_path: Option<String>,
+) -> Response<Body> {
     // portforward negotiates "portforward.k8s.io" via X-Stream-Protocol-Version.
     let ok = req
         .headers()
@@ -241,7 +254,7 @@ fn spdy_portforward_upgrade(mut req: Request<Body>, dial_host: String) -> Respon
     tokio::spawn(async move {
         if let Ok(upgraded) = on_upgrade.await {
             let io = TokioIo::new(upgraded);
-            spdy::conn::run_portforward(io, dial_host).await;
+            spdy::conn::run_portforward(io, dial_host, netns_path).await;
         }
     });
 

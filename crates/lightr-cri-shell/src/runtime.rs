@@ -371,13 +371,18 @@ async fn validate_container_running<B: CriBackend>(
     .map_err(|e| Status::internal(format!("spawn_blocking join error: {e}")))?
 }
 
-/// Verify a sandbox exists and is Ready; return its dial_target (ip or 127.0.0.1).
+/// Verify a sandbox exists and is Ready; return `(dial_target, netns_path)`.
+///
+/// `dial_target` is the sandbox ip if set, else `127.0.0.1` (host_network).
+/// `netns_path` is the sandbox's pinned netns path when recorded (CNI sandbox);
+/// `None` for host_network. Contract §B (AMENDED 2026-06-19): when `netns_path`
+/// is `Some`, the streamer dials `127.0.0.1:<port>` INSIDE that netns.
 // Status is ~176 bytes; it is the canonical gRPC error type here.
 #[allow(clippy::result_large_err)]
 async fn validate_sandbox_ready_get_ip<B: CriBackend>(
     backend: Arc<B>,
     id: SandboxId,
-) -> Result<String, Status> {
+) -> Result<(String, Option<String>), Status> {
     tokio::task::spawn_blocking(move || {
         let ss = backend.sandbox_status(&id).map_err(crate::map_err)?;
         if ss.state != SandboxState::Ready {
@@ -387,7 +392,8 @@ async fn validate_sandbox_ready_get_ip<B: CriBackend>(
             )));
         }
         // dial_target: sandbox ip if set, else 127.0.0.1 (host_network path)
-        Ok(ss.ip.unwrap_or_else(|| "127.0.0.1".to_string()))
+        let dial = ss.ip.unwrap_or_else(|| "127.0.0.1".to_string());
+        Ok((dial, ss.netns_path))
     })
     .await
     .map_err(|e| Status::internal(format!("spawn_blocking join error: {e}")))?
@@ -800,6 +806,7 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
             stdin: req.stdin,
             ports: vec![],
             dial_target: None,
+            netns_path: None,
         };
         let url = self.mint_url(StreamVerb::Exec, params)?;
         Ok(Response::new(proto::ExecResponse { url }))
@@ -826,6 +833,7 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
             stdin: req.stdin,
             ports: vec![],
             dial_target: None,
+            netns_path: None,
         };
         let url = self.mint_url(StreamVerb::Attach, params)?;
         Ok(Response::new(proto::AttachResponse { url }))
@@ -840,10 +848,12 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
         let req = request.into_inner();
         let id = SandboxId(req.pod_sandbox_id.clone());
 
-        // Validate: sandbox must exist and be Ready. Also read the sandbox ip.
+        // Validate: sandbox must exist and be Ready. Read the sandbox ip AND
+        // the netns_path (contract §B AMENDED 2026-06-19: portforward dials
+        // INSIDE the sandbox netns when one is recorded).
         let backend = Arc::clone(&self.backend);
         let id2 = id.clone();
-        let dial_target: String = validate_sandbox_ready_get_ip(backend, id2).await?;
+        let (dial_target, netns_path) = validate_sandbox_ready_get_ip(backend, id2).await?;
 
         let params = StreamParams {
             container: None,
@@ -853,6 +863,7 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
             stdin: false,
             ports: req.port,
             dial_target: Some(dial_target),
+            netns_path,
         };
         let url = self.mint_url(StreamVerb::PortForward, params)?;
         Ok(Response::new(proto::PortForwardResponse { url }))
@@ -1275,6 +1286,7 @@ mod tests {
             stdin: true,
             ports: vec![],
             dial_target: None,
+            netns_path: None,
         };
         let url = shell.mint_url(StreamVerb::Exec, params).unwrap();
         assert!(url.starts_with("http://127.0.0.1:12345/exec/"), "url={url}");
@@ -1300,6 +1312,7 @@ mod tests {
             stdin: false,
             ports: vec![80],
             dial_target: Some("10.0.0.5".to_string()),
+            netns_path: None,
         };
         let url = shell.mint_url(StreamVerb::PortForward, params).unwrap();
         assert!(

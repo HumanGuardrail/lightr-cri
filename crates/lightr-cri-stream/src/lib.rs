@@ -57,6 +57,11 @@ pub struct StreamParams {
     /// portforward dial host (pod IP or `127.0.0.1`); the streamer connects to
     /// `<dial_target>:<port>` where `<port>` comes from the SPDY/WS stream.
     pub dial_target: Option<String>,
+    /// portforward sandbox netns path (contract §B, AMENDED 2026-06-19). When
+    /// `Some`, the streamer `setns(CLONE_NEWNET)` into this path on a dedicated
+    /// thread and dials `127.0.0.1:<port>` INSIDE the sandbox netns. `None` =
+    /// host_network sandbox → keep the host-netns dial of `dial_target`.
+    pub netns_path: Option<String>,
 }
 
 /// The shell's factory: opens a live exec/attach I/O session when a token is

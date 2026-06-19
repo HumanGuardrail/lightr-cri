@@ -79,9 +79,21 @@ fn pull_image_with_auth(&self, image_ref: &str, _auth: Option<&AuthConfig>)
     -> Result<PulledImage> { self.pull_image(image_ref) }
 ```
 
-PortForward needs no backend method: the streamer dials
-`SandboxStatus.ip:port` (CNI IPs are host^W runner-netns-routable by design)
-or `127.0.0.1:port` for host_network sandboxes.
+PortForward needs no backend method. AMENDED 2026-06-19 (owner-authorized):
+portforward enters the sandbox netns. The streamer dials INSIDE the sandbox
+network namespace — it `setns(CLONE_NEWNET)` into `SandboxStatus.netns_path`
+(carried through the stream token alongside `dial_target`) and then connects to
+`127.0.0.1:<port>`; `host_network` sandboxes (no recorded `netns_path`) keep
+the host-netns dial unchanged. The setns is performed on a DEDICATED
+`std::thread` (never a tokio worker — `setns` mutates the calling thread's
+netns and would corrupt sibling async tasks); the connected socket fd is handed
+back to the async task and adopted as a tokio `TcpStream`.
+
+SUPERSEDED original bet (kept for the record): "the streamer dials
+`SandboxStatus.ip:port` (CNI IPs are host-routable by design) or
+`127.0.0.1:port` for host_network." That CNI-IP-from-host-netns dial never
+reached the in-sandbox listener under the critest CNI (60s timeout at
+networking.go:288), so it is replaced by the in-netns dial above.
 
 ## §C Container log law (behavioral, no new method)
 

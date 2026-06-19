@@ -39,6 +39,7 @@ fn exec_params() -> StreamParams {
         stdin: true,
         ports: vec![],
         dial_target: None,
+        netns_path: None,
     }
 }
 

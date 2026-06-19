@@ -261,6 +261,7 @@ fn exec_params() -> StreamParams {
         stdin: false,
         ports: vec![],
         dial_target: None,
+        netns_path: None,
     }
 }
 

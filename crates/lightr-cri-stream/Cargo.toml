@@ -7,6 +7,11 @@ publish = false
 
 [dependencies]
 lightr-cri-backend = { path = "../lightr-cri-backend" }
+# lightr-cri-net: the portforward dial enters the sandbox netns (contract §B,
+# AMENDED 2026-06-19) via netns::dial_in_netns, which owns the setns/libc +
+# dedicated-thread logic. This is a SYNC crate (no tokio/tonic) — depending on
+# it from this tokio crate does not breach the WP-B firewall.
+lightr-cri-net = { path = "../lightr-cri-net" }
 # tokio: workspace pins rt-multi-thread/net/signal/macros; WP-C also needs
 # io-util/fs/sync/time to bridge the sync StreamSession Files to async and to
 # enforce token TTLs. These are tokio features, not new crates of record.

@@ -161,3 +161,55 @@ pub fn join_netns(path: &Path) -> io::Result<OwnedFd> {
     // the OwnedFd is the sole owner.
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
+
+/// Dial `127.0.0.1:port` (or `host:port`) from INSIDE the sandbox network
+/// namespace pinned at `netns_path` (contract §B, AMENDED 2026-06-19:
+/// portforward enters the sandbox netns).
+///
+/// `setns(CLONE_NEWNET)` mutates the CALLING THREAD's network namespace, so it
+/// MUST NOT run on a tokio worker thread (it would corrupt every other async
+/// task time-sharing that thread). This runs the `setns` + blocking
+/// `TcpStream::connect` on a DEDICATED `std::thread` that we own end-to-end:
+/// the thread joins the ns, connects, and the connected `std::net::TcpStream`
+/// is moved back across the `.join()` boundary. The thread then exits, so its
+/// mutated netns is discarded with it — the caller's threads are never touched.
+///
+/// The returned stream is a blocking `std::net::TcpStream`; the async caller
+/// sets it non-blocking and adopts it with `tokio::net::TcpStream::from_std`.
+///
+/// `host_network` sandboxes have no `netns_path` and must NOT call this — they
+/// keep the ordinary host-netns dial.
+pub fn dial_in_netns(netns_path: &str, host: &str, port: u16) -> io::Result<std::net::TcpStream> {
+    let netns_path = netns_path.to_string();
+    let host = host.to_string();
+    std::thread::spawn(move || -> io::Result<std::net::TcpStream> {
+        enter_netns(&netns_path)?;
+        // Now inside the sandbox netns: 127.0.0.1 routes to the pod loopback.
+        std::net::TcpStream::connect((host.as_str(), port))
+    })
+    .join()
+    .map_err(|_| io::Error::other("dial_in_netns thread panicked"))?
+}
+
+/// setns(CLONE_NEWNET) the calling thread into the pinned netns. Linux-only;
+/// the OwnedFd from `join_netns` is closed when this returns (success or not).
+#[cfg(target_os = "linux")]
+fn enter_netns(netns_path: &str) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let ns_fd = join_netns(Path::new(netns_path))?;
+    // SAFETY: ns_fd is a valid, open O_RDONLY netns fd owned by this thread.
+    let rc = unsafe { libc::setns(ns_fd.as_raw_fd(), libc::CLONE_NEWNET) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // ns_fd's Drop closes the fd; the thread keeps the netns until it exits.
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn enter_netns(_netns_path: &str) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "setns is Linux-only",
+    ))
+}
