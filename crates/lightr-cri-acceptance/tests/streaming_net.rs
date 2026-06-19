@@ -66,6 +66,11 @@ fn write_ctr_json(
         "metadata": { "name": name, "attempt": 0 },
         "image": { "image": image },
         "command": command,
+        // CRI ContainerConfig.log_path is RELATIVE to the sandbox logDirectory;
+        // crictl joins sandbox.logDirectory + this and refuses `logs` if empty
+        // ("the container has not set log path"). Give every container a stable
+        // per-container relative path so the fake tees to logDirectory/<name>.log.
+        "logPath": format!("{name}.log"),
         "linux": {}
     });
     if let Some(pm) = port_mappings {
