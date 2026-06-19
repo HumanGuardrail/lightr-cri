@@ -905,10 +905,34 @@ impl CriBackend for FakeBackend {
 
         // ── Set up stdio ─────────────────────────────────────────────────────
 
-        // Decide on pty vs. pipe mode based on config.tty
-        let use_tty = rec.config.tty;
+        // Decide on pty vs. pipe mode.
+        //
+        // Normally this follows config.tty. ONE narrow exception: some programs
+        // refuse to run without a controlling terminal and exit immediately when
+        // their stdio is a pipe/null. The canonical case is procps `top`, which
+        // cri-tools uses as its DefaultLinuxContainerCommand keep-alive entrypoint
+        // (`["top"]`): with no tty it prints "failed tty get" and exits within ~1s,
+        // so the container reaches Exited before a slow exec (e.g. the
+        // "execSync with timeout" conformance loop) can run — the container
+        // self-exits, independent of any kill path.
+        //
+        // To make such a keep-alive command GENUINELY persist (real execution on a
+        // real pty, NOT a faked Running state) we route it through the pty path even
+        // when config.tty == false: the child sees a tty, runs its loop, and stays
+        // Running. The detection is deliberately minimal — the program basename,
+        // not a heuristic on flags — so we only special-case the documented
+        // terminal-requiring keep-alive command and nothing else. Containers whose
+        // command does not need a tty keep the existing pipe/null stdio + fan-out.
+        let program_basename = std::path::Path::new(program)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(program.as_str());
+        let requires_tty = program_basename == "top";
 
-        // tty=false: delegate to pipe-mode helper and return early
+        let use_tty = rec.config.tty || requires_tty;
+
+        // tty=false (and not a terminal-requiring command): delegate to pipe-mode
+        // helper and return early.
         if !use_tty {
             use std::process::Stdio;
             cmd.stdout(Stdio::piped());
