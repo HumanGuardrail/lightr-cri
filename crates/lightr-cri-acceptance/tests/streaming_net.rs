@@ -8,7 +8,7 @@
 //! Tests reuse ServerHandle / crictl / find_server_bin / skip / have from lib.rs.
 
 use lightr_cri_acceptance::{
-    crictl, find_server_bin, have, have_cap_sys_admin, skip, ServerHandle,
+    crictl, find_server_bin, have, have_cap_sys_admin, skip, skip_by_design, ServerHandle,
 };
 use std::path::{Path, PathBuf};
 
@@ -188,11 +188,11 @@ fn b1_streaming_exec() {
 #[test]
 fn b2_attach() {
     let _bin = b_probes!("B2");
-    skip(
+    skip_by_design(
         "B2",
-        "crictl attach requires interactive PTY; cannot be driven deterministically \
-         from a Rust test process (no --input-file flag). \
-         Attach SPDY path covered by WP-E vector suite.",
+        "crictl attach requires an interactive PTY on crictl's own stdin; cannot be \
+         driven deterministically from a Rust test process (no --input-file flag).",
+        "critest attach validation (A10 gate) + WP-E SPDY/WS attach vector suite",
     );
 }
 

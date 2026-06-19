@@ -114,9 +114,10 @@ async fn spdy_upgrade_handshake_101_and_protocol_echo() {
     assert!(head.starts_with("HTTP/1.1 101"), "got: {head}");
     let lower = head.to_lowercase();
     assert!(lower.contains("upgrade: spdy/3.1"), "got: {head}");
-    // server max is v4 (never v5); hyper emits header names lowercased
+    // server negotiates the highest offered — v5 (wire-compatible with v4);
+    // hyper emits header names lowercased
     assert!(
-        lower.contains("x-stream-protocol-version: v4.channel.k8s.io"),
+        lower.contains("x-stream-protocol-version: v5.channel.k8s.io"),
         "got: {head}"
     );
 
@@ -140,7 +141,7 @@ async fn spdy_protocol_mismatch_is_403() {
          Host: localhost\r\n\
          Connection: Upgrade\r\n\
          Upgrade: SPDY/3.1\r\n\
-         X-Stream-Protocol-Version: v5.channel.k8s.io\r\n\r\n"
+         X-Stream-Protocol-Version: v99.bogus.k8s.io\r\n\r\n"
     );
     s.write_all(req.as_bytes()).await.unwrap();
     let head = read_response_head(&mut s).await;

@@ -35,6 +35,16 @@ pub fn skip(item: &str, reason: &str) {
     eprintln!("SKIP {item}: {reason} (probe-truthful; see build-spec-r0 §7)");
 }
 
+/// Skip a check that CANNOT be driven from a Rust test process *by construction*
+/// (e.g. crictl attach needs an interactive PTY on crictl's own stdin), where the
+/// capability IS validated elsewhere. Unlike [`skip`], this does NOT fail under
+/// `LIGHTR_CRI_REQUIRE_PROBES`: it is not a missing environment probe (a real gap
+/// the fail-closed law guards against), it is a harness limitation with explicit
+/// coverage elsewhere — which `covered_by` must name so the exemption stays honest.
+pub fn skip_by_design(item: &str, reason: &str, covered_by: &str) {
+    eprintln!("SKIP-BY-DESIGN {item}: {reason} (covered by: {covered_by})");
+}
+
 /// Locate the `lightr-cri` binary.
 /// Checks env LIGHTR_CRI_BIN, then target/release/lightr-cri, then target/debug/lightr-cri.
 pub fn find_server_bin() -> Option<PathBuf> {

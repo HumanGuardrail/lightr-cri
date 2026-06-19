@@ -18,12 +18,16 @@ pub const SPDY_PROTOCOL_V4: &str = "v4.channel.k8s.io";
 pub const SPDY_PORTFORWARD: &str = "portforward.k8s.io";
 
 /// SPDY exec/attach protocol versions the server understands, lowest→highest.
-/// v5 is NOT served (server max = v4), matching containerd/CRI-O.
+/// v5 is wire-compatible with v4 — it only adds per-stream half-close signalling
+/// on top of identical v4 framing. Modern crictl/cri-tools (v1.33) offer ONLY
+/// v5 even over the SPDY transport (default `--transport=spdy`), so we accept and
+/// echo it, served through the v4 connection driver (matches modern containerd/CRI-O).
 pub const SPDY_EXEC_PROTOCOLS: &[&str] = &[
     "channel.k8s.io",
     "v2.channel.k8s.io",
     "v3.channel.k8s.io",
     "v4.channel.k8s.io",
+    "v5.channel.k8s.io",
 ];
 
 /// Negotiate the SPDY exec/attach stream-protocol version from the client's
@@ -50,17 +54,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn negotiate_picks_v4_max() {
+    fn negotiate_picks_v5_max() {
         assert_eq!(
             negotiate_exec_protocol("v5.channel.k8s.io,v4.channel.k8s.io,v3.channel.k8s.io"),
-            Some("v4.channel.k8s.io")
+            Some("v5.channel.k8s.io")
         );
     }
 
     #[test]
-    fn negotiate_never_v5() {
-        // v5 only → no overlap (server max v4)
-        assert_eq!(negotiate_exec_protocol("v5.channel.k8s.io"), None);
+    fn negotiate_v5_only() {
+        // crictl v1.33 offers only v5 over SPDY → accepted (v4-compatible framing)
+        assert_eq!(
+            negotiate_exec_protocol("v5.channel.k8s.io"),
+            Some("v5.channel.k8s.io")
+        );
     }
 
     #[test]

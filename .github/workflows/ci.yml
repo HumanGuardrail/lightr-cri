@@ -88,7 +88,9 @@ jobs:
           # The bridge plugin (ipMasq) and portmap need iptables for NAT;
           # iproute2 for veth/netns tooling. rust:1.96-bookworm ships neither.
           sudo apt-get update -qq
-          sudo apt-get install -y -qq iptables iproute2
+          # busybox + netcat: the acceptance B3/B4/B5 tests start an in-container
+          # HTTP responder (the fake execs the command on the host) — need nc/busybox.
+          sudo apt-get install -y -qq iptables iproute2 busybox netcat-openbsd
           # CNI plugins exec iptables via $PATH; ensure /usr/sbin is on it for
           # the server + test steps (Actions step PATH can be restricted).
           echo "/usr/sbin" >> "$GITHUB_PATH"
@@ -142,6 +144,9 @@ jobs:
           curl -fsSL -o "${KUBELET_CACHE}/kubelet" "${KUBELET_URL}"
           echo "${KUBELET_SHA256}  ${KUBELET_CACHE}/kubelet" | sha256sum -c -
           chmod +x "${KUBELET_CACHE}/kubelet"
+          # put kubelet on PATH: the dedicated kubelet-smoke gate uses KUBELET_BIN,
+          # but the acceptance B7 probe (in cargo test) checks PATH for `kubelet`.
+          echo "${KUBELET_CACHE}" >> "$GITHUB_PATH"
           echo "kubelet v1.33.13 cached at ${KUBELET_CACHE}/kubelet"
 
       - name: cargo test --workspace (A9 vectors + fake + shell + acceptance A1–A8)
