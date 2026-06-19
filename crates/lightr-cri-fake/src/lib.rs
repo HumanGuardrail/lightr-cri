@@ -1819,7 +1819,7 @@ fn install_container_pre_exec(
                     // propagate to the host (MS_REC | MS_PRIVATE).
                     libc::mount(
                         std::ptr::null(),
-                        b"/\0".as_ptr() as *const libc::c_char,
+                        c"/".as_ptr(),
                         std::ptr::null(),
                         libc::MS_REC | libc::MS_PRIVATE,
                         std::ptr::null(),
