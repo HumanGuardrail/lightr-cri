@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use super::frame::{self, Frame, ParseResult};
 use super::headers::{self, get};
@@ -134,135 +134,294 @@ pub async fn run_exec<S>(
     };
     let mut session = session;
 
-    // stream_id → role
-    let mut roles: HashMap<u32, u8> = HashMap::new();
+    // stream_id → role (mutated inside the read-loop task it is moved into)
+    let roles: HashMap<u32, u8> = HashMap::new();
     // role → stream_id (for output routing)
-    let mut by_role: HashMap<u8, u32> = HashMap::new();
+    let by_role: HashMap<u8, u32> = HashMap::new();
 
-    // output pump tasks spawned once we know stdout/stderr stream ids
-    let mut stdin = session
+    // output pump tasks spawned once we know stdout/stderr stream ids. These
+    // are moved into the read-loop task below and (re)bound `mut` there.
+    let stdin = session
         .as_mut()
         .and_then(|s| s.stdin.take())
         .map(bridge::adopt);
     let pty_master = session.as_mut().and_then(|s| s.pty_master.take());
     // hold raw output files until their stream is opened
-    let mut stdout_raw = session.as_mut().and_then(|s| s.stdout.take());
-    let mut stderr_raw = session.as_mut().and_then(|s| s.stderr.take());
+    let stdout_raw = session.as_mut().and_then(|s| s.stdout.take());
+    let stderr_raw = session.as_mut().and_then(|s| s.stderr.take());
     let waiter = session.map(|s| s.waiter);
 
-    let mut output_tasks = Vec::new();
+    // Routing/output state that BOTH the concurrent read-loop and the
+    // completion path read: the read-loop discovers which stream ids the
+    // client opened for stdout/stderr/error and spawns the output pumps; the
+    // completion path (driven by child-exit, below) needs those ids to FIN the
+    // right streams and to await the right pumps. Shared behind a mutex.
+    let by_role = Arc::new(Mutex::new(by_role));
+    let output_tasks = Arc::new(Mutex::new(Vec::<tokio::task::JoinHandle<()>>::new()));
+    // Fired by the read-loop after every `by_role` insert, so the completion
+    // path can wait for the client's output/error stream ids to land instead
+    // of racing a fast-exiting child (see the fast-exit barrier below).
+    let role_added = Arc::new(Notify::new());
 
-    loop {
-        let f = match read_frame(&mut rd, &mut buf).await {
-            Ok(Some(f)) => f,
-            Ok(None) | Err(_) => break,
-        };
-        match f {
-            Frame::SynStream {
-                stream_id,
-                header_block,
-                ..
-            } => {
-                let hdr = decomp
-                    .decompress(&header_block)
-                    .ok()
-                    .and_then(|b| headers::deserialize_headers(&b))
-                    .unwrap_or_default();
-                let role = match get(&hdr, "streamType") {
-                    Some("stdin") => ch::STDIN,
-                    Some("stdout") => ch::STDOUT,
-                    Some("stderr") => ch::STDERR,
-                    Some("error") => ch::ERROR,
-                    Some("resize") => ch::RESIZE,
-                    _ => 0xff,
+    // Fired when the read-loop ends because the CLIENT closed its side
+    // (EOF/RST/GoAway). For attach this is a detach; it is one of the two
+    // completion triggers (the other is output-drain).
+    let client_closed = Arc::new(Notify::new());
+
+    // ── concurrent read-loop ──────────────────────────────────────────────
+    //
+    // The bug this fixes: completion used to be triggered by THIS loop ending,
+    // and the loop only ends on transport close. Real client-go keeps its
+    // write half open and blocks on the server's terminal Status → deadlock.
+    // So the loop now runs CONCURRENTLY with completion (driven by output
+    // drain / detach) and is NOT itself what completes the session. The loop
+    // keeps draining stdin + resize + ping for as long as the client stays
+    // connected, and signals `client_closed` when the client tears down.
+    let read_loop = {
+        let writer = writer.clone();
+        let by_role = by_role.clone();
+        let output_tasks = output_tasks.clone();
+        let role_added = role_added.clone();
+        let client_closed = client_closed.clone();
+        tokio::spawn(async move {
+            let mut roles = roles;
+            let mut stdin = stdin;
+            let mut stdout_raw = stdout_raw;
+            let mut stderr_raw = stderr_raw;
+            loop {
+                let f = match read_frame(&mut rd, &mut buf).await {
+                    Ok(Some(f)) => f,
+                    // Transport close (EOF/RST). After the server has signalled
+                    // completion this is the client's benign conn.Close; before,
+                    // it is an aborted client. Either way the read-loop simply
+                    // ends — completion is owned by the reaper, not here.
+                    Ok(None) | Err(_) => break,
                 };
-                {
-                    let mut w = writer.lock().await;
-                    let _ = w.syn_reply(stream_id).await;
-                }
-                roles.insert(stream_id, role);
-                by_role.insert(role, stream_id);
-
-                // When an output stream opens, spawn its pump.
-                if role == ch::STDOUT {
-                    if let Some(file) = stdout_raw.take() {
-                        output_tasks.push(spawn_output(
-                            writer.clone(),
-                            stream_id,
-                            bridge::adopt(file),
-                        ));
-                    }
-                } else if role == ch::STDERR {
-                    if let Some(file) = stderr_raw.take() {
-                        output_tasks.push(spawn_output(
-                            writer.clone(),
-                            stream_id,
-                            bridge::adopt(file),
-                        ));
-                    }
-                }
-            }
-            Frame::Data {
-                stream_id,
-                flags,
-                data,
-            } => {
-                match roles.get(&stream_id).copied() {
-                    Some(ch::STDIN) => {
-                        if let Some(f) = stdin.as_mut() {
-                            let _ = f.write_all(&data).await;
-                            let _ = f.flush().await;
-                        }
-                    }
-                    Some(ch::RESIZE) => {
-                        if let (Some(sz), Some(pty)) =
-                            (ch::parse_resize(&data), pty_master.as_ref())
+                match f {
+                    Frame::SynStream {
+                        stream_id,
+                        header_block,
+                        ..
+                    } => {
+                        let hdr = decomp
+                            .decompress(&header_block)
+                            .ok()
+                            .and_then(|b| headers::deserialize_headers(&b))
+                            .unwrap_or_default();
+                        let role = match get(&hdr, "streamType") {
+                            Some("stdin") => ch::STDIN,
+                            Some("stdout") => ch::STDOUT,
+                            Some("stderr") => ch::STDERR,
+                            Some("error") => ch::ERROR,
+                            Some("resize") => ch::RESIZE,
+                            _ => 0xff,
+                        };
                         {
-                            bridge::set_winsize(pty, sz.width, sz.height);
+                            let mut w = writer.lock().await;
+                            let _ = w.syn_reply(stream_id).await;
+                        }
+                        roles.insert(stream_id, role);
+                        by_role.lock().await.insert(role, stream_id);
+                        // Wake the completion barrier: a new role id just landed.
+                        role_added.notify_waiters();
+
+                        // When an output stream opens, spawn its pump.
+                        if role == ch::STDOUT {
+                            if let Some(file) = stdout_raw.take() {
+                                output_tasks.lock().await.push(spawn_output(
+                                    writer.clone(),
+                                    stream_id,
+                                    bridge::adopt(file),
+                                ));
+                            }
+                        } else if role == ch::STDERR {
+                            if let Some(file) = stderr_raw.take() {
+                                output_tasks.lock().await.push(spawn_output(
+                                    writer.clone(),
+                                    stream_id,
+                                    bridge::adopt(file),
+                                ));
+                            }
                         }
                     }
-                    _ => {}
+                    Frame::Data {
+                        stream_id,
+                        flags,
+                        data,
+                    } => {
+                        match roles.get(&stream_id).copied() {
+                            Some(ch::STDIN) => {
+                                if let Some(f) = stdin.as_mut() {
+                                    let _ = f.write_all(&data).await;
+                                    let _ = f.flush().await;
+                                }
+                            }
+                            Some(ch::RESIZE) => {
+                                if let (Some(sz), Some(pty)) =
+                                    (ch::parse_resize(&data), pty_master.as_ref())
+                                {
+                                    bridge::set_winsize(pty, sz.width, sz.height);
+                                }
+                            }
+                            _ => {}
+                        }
+                        if flags & frame::FLAG_FIN != 0 {
+                            // client half-closed this stream
+                            if roles.get(&stream_id).copied() == Some(ch::STDIN) {
+                                // drop stdin so the process sees EOF
+                                stdin = None;
+                            }
+                        }
+                    }
+                    Frame::Ping { id } => {
+                        let mut w = writer.lock().await;
+                        let _ = w.write_frame(&Frame::Ping { id }).await;
+                    }
+                    Frame::RstStream { .. } | Frame::GoAway { .. } => break,
+                    Frame::Settings { .. }
+                    | Frame::WindowUpdate { .. }
+                    | Frame::Headers { .. } => {}
+                    Frame::SynReply { .. } => {}
                 }
-                if flags & frame::FLAG_FIN != 0 {
-                    // client half-closed this stream
-                    if roles.get(&stream_id).copied() == Some(ch::STDIN) {
-                        // drop stdin so the process sees EOF
-                        stdin = None;
+            }
+            // The loop only exits on a client-initiated close (EOF/RST/GoAway).
+            // Signal it so the completion path treats this as a detach.
+            client_closed.notify_waiters();
+        })
+    };
+
+    // ── completion driven by OUTPUT-DRAIN or DETACH, not transport close ──
+    //
+    // Completion TRIGGER (robust for BOTH verbs, mirroring ws.rs run_session):
+    //   - PRIMARY: all output pumps drain to EOF. For exec this coincides with
+    //     process exit; for attach it is container/pty exit.
+    //   - OR: the client closes its side (detach). For attach this is the
+    //     common case (the container outlives the session); for exec it is an
+    //     aborted client.
+    // Whichever fires first completes the session.
+    //
+    // The exit CODE for the exec Status still comes from the reaper, run as a
+    // concurrent task so it never gates the trigger: for exec it resolves on
+    // process exit (≈ output-drain); for attach `AttachWaiter` returns Ok(0)
+    // instantly → Status{Success}, which is the "container exit code if known,
+    // else Success" semantics. The read-loop keeps draining stdin/resize/ping
+    // concurrently throughout.
+    if let Some(waiter) = waiter {
+        let is_attach = verb == StreamVerb::Attach;
+        let reaper = tokio::task::spawn_blocking(move || waiter.wait());
+
+        // Arm the detach signal ONCE, up front, and reuse the SAME future in
+        // both selects below. `Notify::notified()` only observes a
+        // `notify_waiters()` that fires AFTER the future is registered, so a
+        // fresh `notified()` per select would miss a detach that raced an
+        // earlier phase and could hang (attach with a long-lived container).
+        // Pinning one future latches the next notify across both phases.
+        let detached = client_closed.notified();
+        tokio::pin!(detached);
+
+        // 0. Fast-exit barrier. A fast command (e.g. `echo`) can make the
+        //    output pumps drain BEFORE the read-loop has processed the client's
+        //    stdout/error SYN_STREAM frames. If we snapshot `by_role` now we
+        //    may miss those ids and silently skip the FIN/Status — and a real
+        //    client-go executor then hangs forever on a Status that never
+        //    comes. So WAIT until both STDOUT and ERROR ids are present
+        //    (STDERR is optional — absent for TTY execs), bounded by a ~5s
+        //    backstop. For attach the client may detach before opening any
+        //    output stream, so race the barrier against `client_closed` and
+        //    bail straight to teardown on detach. Deadlock-free: conformant
+        //    client-go opens error+stdout (and stderr for non-TTY) via
+        //    SYN_STREAM synchronously at stream() start, BEFORE it blocks on
+        //    the server, so the barrier resolves in ms.
+        let barrier = async {
+            loop {
+                // Register for the next notify BEFORE re-checking, so an insert
+                // racing between check and await is not lost.
+                let notified = role_added.notified();
+                {
+                    let g = by_role.lock().await;
+                    if g.contains_key(&ch::STDOUT) && g.contains_key(&ch::ERROR) {
+                        break;
                     }
                 }
+                notified.await;
             }
-            Frame::Ping { id } => {
-                let mut w = writer.lock().await;
-                let _ = w.write_frame(&Frame::Ping { id }).await;
-            }
-            Frame::RstStream { .. } | Frame::GoAway { .. } => break,
-            Frame::Settings { .. } | Frame::WindowUpdate { .. } | Frame::Headers { .. } => {}
-            Frame::SynReply { .. } => {}
+        };
+        let mut detached_fired = false;
+        tokio::select! {
+            _ = tokio::time::timeout(std::time::Duration::from_secs(5), barrier) => {}
+            _ = &mut detached => { detached_fired = true; }
         }
-    }
 
-    // Drain stdout/stderr to EOF BEFORE the terminal Status. The output pumps
-    // run until their file hits EOF (the process closed its end); client-go
-    // expects every stdout/stderr byte to precede the v4 Status on the error
-    // stream. Awaiting (not aborting) the pumps is what actually delivers the
-    // output — aborting here truncates/drops it on a fast-exiting process, the
-    // wire-break where the session is unit-green but pumps nothing.
-    for t in output_tasks {
-        let _ = t.await;
-    }
+        // 1. PRIMARY completion trigger: drain stdout/stderr to EOF, raced
+        //    against a client-initiated detach. The output pumps run until
+        //    their file hits EOF (the process/container closed its end);
+        //    client-go expects every stdout/stderr byte to precede the v4
+        //    Status on the error stream. We AWAIT (not abort) the pumps so a
+        //    fast-exiting process's tail bytes are not truncated. A concurrent
+        //    `client_closed` (detach) wins the race when the client tears down
+        //    first — for attach this is the normal completion path.
+        //    If the client already detached during the barrier phase, `detached`
+        //    is resolved and must not be polled again (a completed `Notified`
+        //    panics on re-poll); skip straight to teardown in that case.
+        if !detached_fired {
+            let drain = async {
+                let tasks = std::mem::take(&mut *output_tasks.lock().await);
+                for t in tasks {
+                    let _ = t.await;
+                }
+            };
+            tokio::select! {
+                _ = drain => {}
+                _ = &mut detached => {}
+            }
+        }
 
-    // Reap the process and emit the v4 Status on the error stream.
-    if let Some(waiter) = waiter {
-        let exit = tokio::task::spawn_blocking(move || waiter.wait())
-            .await
-            .unwrap_or(Ok(-1))
-            .unwrap_or(-1);
-        if let Some(err_id) = by_role.get(&ch::ERROR).copied() {
+        // Exit code for the Status. Exec: the reaper's real code → Success /
+        // Failure+NonZeroExitCode. Attach has no meaningful exit code (the
+        // container outlives the session) → emit Status{Success} (exit 0) and
+        // do NOT block on the reaper, which would hang until the container
+        // itself exits; abort it instead.
+        let exit = if is_attach {
+            reaper.abort();
+            0
+        } else {
+            reaper.await.unwrap_or(Ok(-1)).unwrap_or(-1)
+        };
+
+        // Snapshot the stream ids the client actually opened. We FIN only
+        // streams the client opened to read: for a TTY exec there is no
+        // stderr stream, so `STDERR` is simply absent and gets no FIN.
+        let by_role = by_role.lock().await;
+        let stdout_id = by_role.get(&ch::STDOUT).copied();
+        let stderr_id = by_role.get(&ch::STDERR).copied();
+        let error_id = by_role.get(&ch::ERROR).copied();
+        drop(by_role);
+
+        let mut w = writer.lock().await;
+        // 2. FLAG_FIN on stdout (empty DATA frame, fin flag set).
+        if let Some(id) = stdout_id {
+            let _ = w.data(id, frame::FLAG_FIN, Vec::new()).await;
+        }
+        // 3. FLAG_FIN on stderr (only if the client opened one — absent for TTY).
+        if let Some(id) = stderr_id {
+            let _ = w.data(id, frame::FLAG_FIN, Vec::new()).await;
+        }
+        // 4 + 5. v4 metav1.Status on the error stream, then its FLAG_FIN — the
+        //        final completion gate. The empty DATA + fin in one frame both
+        //        delivers the Status client-go's errorstream.go decodes and
+        //        closes the error stream.
+        if let Some(id) = error_id {
             let json = status::exit_status_json(exit);
-            let mut w = writer.lock().await;
-            let _ = w.data(err_id, frame::FLAG_FIN, json).await;
+            let _ = w.data(id, frame::FLAG_FIN, json).await;
         }
+        drop(w);
     }
+
+    // Completion has been signalled (or there was no process to reap). The
+    // client's subsequent conn.Close once it reads the Status is a benign
+    // normal end; we no longer need the read-loop, so let it wind down.
+    read_loop.abort();
+    let _ = read_loop.await;
 }
 
 /// Pump a session output file → DATA frames on `stream_id` until EOF.
@@ -381,7 +540,9 @@ where
                 }
             }
             Frame::Data {
-                stream_id, data, ..
+                stream_id,
+                flags,
+                data,
             } => {
                 if let Some(req) = data_route.get(&stream_id) {
                     if let Some(pair) = pairs.get(req) {
@@ -389,6 +550,14 @@ where
                             let mut g = tcp.lock().await;
                             let _ = g.write_all(&data).await;
                             let _ = g.flush().await;
+                            // Propagate the client's CloseWrite (FLAG_FIN) to the
+                            // backend as a TCP half-close: shut down the write
+                            // half so the backend sees EOF. Do NOT drop the pair —
+                            // the backend→client read direction (the TCP→SPDY pump
+                            // holding the read half) must keep flowing.
+                            if flags & frame::FLAG_FIN != 0 {
+                                let _ = g.shutdown().await;
+                            }
                         }
                     }
                 }
@@ -401,8 +570,28 @@ where
             _ => {}
         }
     }
-    for t in tcp_tasks {
-        t.abort();
+    // BOUNDED drain of the TCP→SPDY pumps. We await (do NOT abort) so in-flight
+    // backend bytes are flushed to the client instead of being truncated
+    // mid-transfer — the common case is a half-close where the backend EOFs
+    // promptly and each pump returns on its own. But a backend that keeps its
+    // connection open and never sends EOF after the client disconnects would
+    // make an unconditional await hang forever, so we cap the drain with a
+    // deadline and abort any pump still running past it.
+    let drain_abort: Vec<_> = tcp_tasks.iter().map(|t| t.abort_handle()).collect();
+    let drain = async {
+        for t in tcp_tasks {
+            let _ = t.await;
+        }
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(3), drain)
+        .await
+        .is_err()
+    {
+        // Deadline hit: a non-closing backend kept a pump alive. Abort the
+        // stragglers so run_portforward cannot block indefinitely.
+        for h in drain_abort {
+            h.abort();
+        }
     }
 }
 
