@@ -48,7 +48,7 @@ fn write_pod_json(dir: &Path, name: &str, uid: &str) -> PathBuf {
             "namespace": "acceptance",
             "attempt": 0
         },
-        "logDirectory": "/tmp",
+        "log_directory": "/tmp",
         "linux": {}
     });
     let path = dir.join("pod.json");

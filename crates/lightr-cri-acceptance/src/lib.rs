@@ -15,11 +15,18 @@ use std::time::{Duration, Instant};
 
 /// Probe: is `bin` runnable in PATH?
 pub fn have(bin: &str) -> bool {
-    std::process::Command::new(bin)
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    // Existence-in-PATH check. Do NOT probe with `--version`: tools like
+    // netcat-openbsd's `nc` (and busybox on some builds) have no `--version`
+    // and exit non-zero, a false negative even when the binary is present.
+    std::env::var("PATH")
+        .ok()
+        .into_iter()
+        .flat_map(|path| {
+            path.split(':')
+                .map(|d| std::path::Path::new(d).join(bin))
+                .collect::<Vec<_>>()
+        })
+        .any(|p| p.is_file())
 }
 
 /// Loud skip helper — prints the frozen skip format.

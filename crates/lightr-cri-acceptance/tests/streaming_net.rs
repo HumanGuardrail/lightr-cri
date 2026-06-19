@@ -42,7 +42,7 @@ fn write_pod_json(dir: &Path, name: &str, uid: &str, host_network: bool) -> Path
     };
     let json = serde_json::json!({
         "metadata": { "name": name, "uid": uid, "namespace": "acceptance-b", "attempt": 0 },
-        "logDirectory": "/tmp",
+        "log_directory": "/tmp",
         "linux": linux
     });
     let p = dir.join(format!("{name}-pod.json"));
@@ -70,7 +70,7 @@ fn write_ctr_json(
         // crictl joins sandbox.logDirectory + this and refuses `logs` if empty
         // ("the container has not set log path"). Give every container a stable
         // per-container relative path so the fake tees to logDirectory/<name>.log.
-        "logPath": format!("{name}.log"),
+        "log_path": format!("{name}.log"),
         "linux": {}
     });
     if let Some(pm) = port_mappings {
@@ -587,7 +587,7 @@ fn b5_hostport() {
         serde_json::json!({ "securityContext": { "namespaceOptions": { "network": 0 } } });
     let json = serde_json::json!({
         "metadata": { "name": "b5-pod", "uid": "b5-uid-0001", "namespace": "acceptance-b", "attempt": 0 },
-        "logDirectory": "/tmp",
+        "log_directory": "/tmp",
         "linux": linux_ns
     });
     let pod_path = td.join("b5-pod.json");
