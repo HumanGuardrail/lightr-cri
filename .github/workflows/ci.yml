@@ -8,27 +8,19 @@ on:
 jobs:
   # ── macOS: compile + unit lanes (no crictl/critest) ──────────────────────
   mac-compile:
-    runs-on: [self-hosted, macos]
-    env:
-      # Build outside the runner _work dir: something on this host races
-      # files under _work mid-build (recurrent dep-info ENOENT with clean
-      # state, single listener, direct toolchain). Also: incremental builds.
-      CARGO_TARGET_DIR: /Users/gustavoschneiter/.lightr-ci-target
+    runs-on: macos-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: put rust 1.96.0 on PATH (pre-installed; no rustup)
+      - name: install rust 1.96.0
         run: |
-          # This is a DEDICATED self-hosted mac runner running as a launchd
-          # service: minimal env (HOME may be unset, no ~/.cargo/bin on PATH),
-          # and the rustup proxy is flaky on this host. The 1.96.0 toolchain is
-          # pre-installed with cargo/cargo-clippy/rustfmt in its own bin dir, so
-          # we bypass rustup entirely and just put that dir on PATH.
-          export HOME="${HOME:-/Users/gustavoschneiter}"
-          TC="$HOME/.rustup/toolchains/1.96.0-x86_64-apple-darwin/bin"
-          test -x "$TC/cargo" || { echo "toolchain 1.96.0 missing at $TC" >&2; exit 1; }
-          echo "$TC" >> "$GITHUB_PATH"
+          # GitHub-hosted macOS: rustup is pre-installed. (Moved off the
+          # self-hosted mac runner, which flaked mid-build — rustc ENOENT
+          # under host file races on a loaded machine.)
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup override set 1.96.0
+          rustup component add clippy
 
       - name: cargo build --workspace
         run: cargo build --workspace
@@ -44,13 +36,11 @@ jobs:
 
   # ── Linux: full conformance (vectors A9, fake, shell, acceptance A1–A8, A10) ──
   linux-conformance:
-    runs-on: [self-hosted, linux]
-    # shared-docker machine class: cold builds + critest on a loaded host
-    # exceeded 45m (observed 46m21s → GitHub reports timeout as 'cancelled')
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
       LIGHTR_CRI_REQUIRE_PROBES: "1"
-      LIGHTR_BUDGET_CLASS: shared-docker
+      LIGHTR_BUDGET_CLASS: hosted-linux
     steps:
       - uses: actions/checkout@v4
 
@@ -155,10 +145,13 @@ jobs:
           echo "kubelet v1.33.13 cached at ${KUBELET_CACHE}/kubelet"
 
       - name: cargo test --workspace (A9 vectors + fake + shell + acceptance A1–A8)
-        run: cargo test --workspace
+        # Hosted ubuntu runs as non-root; netns/CNI tests need CAP_SYS_ADMIN.
+        # sudo -E preserves HOME/CARGO_HOME (toolchain resolves); env pins PATH
+        # past sudo's secure_path so ~/.cargo/bin cargo is found.
+        run: sudo -E env "PATH=$PATH" cargo test --workspace
 
       - name: A10 critest gate
-        run: bash ci/critest-gate.sh
+        run: sudo -E env "PATH=$PATH" bash ci/critest-gate.sh
 
       - name: budgets gate
         run: bash ci/budget.sh
@@ -170,11 +163,11 @@ jobs:
         env:
           LIGHTR_CRI_BIN: target/release/lightr-cri
           KUBELET_BIN: /tmp/kubelet-cache/kubelet
-        run: bash ci/kubelet-smoke.sh
+        run: sudo -E env "PATH=$PATH" bash ci/kubelet-smoke.sh
 
   # ── verify-codegen: regenerate proto, diff must be empty ─────────────────
   verify-codegen:
-    runs-on: [self-hosted, linux]
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
