@@ -91,6 +91,58 @@ struct ContainerIo {
     stderr_rd: Option<std::fs::File>,
     /// Write end of the process stdin pipe (if config.stdin=true).
     stdin_wr: Option<std::fs::File>,
+    /// Pipe-mode: output fan-out. The single tee thread per stream reads the
+    /// container's read-end ONCE and (a) writes the CRI log and (b) writes the
+    /// raw bytes to every registered attacher sink here. `open_attach` registers
+    /// a fresh pipe write-end; the tee prunes any sink whose pipe is broken
+    /// (attacher gone). `None` for tty containers.
+    fanout: Option<Arc<FanOut>>,
+}
+
+/// Output fan-out shared between the per-stream tee threads (writers) and
+/// `open_attach` (registers sinks). Holds the write-ends of one OS pipe per
+/// live attacher, split by stream so the CRI streaming server can deliver
+/// stdout and stderr separately. The tee thread is the SOLE reader of the
+/// container's output; it copies raw bytes to each sink, so there is no second
+/// reader racing the log. Sinks that fail to write (attacher detached, pipe
+/// closed) are dropped on the next write — bounded by the number of live
+/// attachers, no leak.
+#[derive(Default)]
+struct FanOut {
+    /// Write-ends of attacher pipes for the stdout stream.
+    stdout_sinks: Mutex<Vec<std::fs::File>>,
+    /// Write-ends of attacher pipes for the stderr stream.
+    stderr_sinks: Mutex<Vec<std::fs::File>>,
+}
+
+impl FanOut {
+    /// Write `data` to every live sink for `stream_name` ("stdout"/"stderr"),
+    /// pruning any sink whose pipe is broken (attacher gone). Single-reader
+    /// fan-out: only the tee thread calls this.
+    fn broadcast(&self, stream_name: &str, data: &[u8]) {
+        use std::io::Write;
+        let sinks = if stream_name == "stderr" {
+            &self.stderr_sinks
+        } else {
+            &self.stdout_sinks
+        };
+        let mut guard = sinks.lock().unwrap();
+        guard.retain_mut(|w| w.write_all(data).and_then(|()| w.flush()).is_ok());
+    }
+}
+
+/// Create an OS pipe, returning (read_end, write_end) as std::fs::File.
+#[cfg(unix)]
+fn make_pipe() -> std::io::Result<(std::fs::File, std::fs::File)> {
+    use std::os::unix::io::FromRawFd;
+    let mut fds = [0i32; 2];
+    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let r = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+    let w = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+    Ok((r, w))
 }
 
 // ---------------------------------------------------------------------------
@@ -514,10 +566,18 @@ fn open_cri_log(log_dir: &str, log_path: &str) -> std::io::Result<Option<fs::Fil
 /// Spawn a tee thread that reads from `reader` and writes CRI-formatted lines
 /// to the log file. The log file handle is Arc<Mutex<>> so multiple streams
 /// can interleave safely.
+///
+/// This is the SINGLE reader of the container's output for this stream. When a
+/// `fanout` is supplied it ALSO copies the raw line bytes (byte-for-byte, the
+/// same bytes that would appear on the container's fd) to every registered
+/// attacher sink, so attach is purely additive and never introduces a second
+/// reader racing the log. The CRI log write path is unchanged and remains
+/// byte-identical regardless of whether attachers are present.
 fn spawn_tee_thread(
     stream_name: &'static str,
     reader: std::fs::File,
     log: Arc<Mutex<Option<fs::File>>>,
+    fanout: Option<Arc<FanOut>>,
 ) {
     std::thread::spawn(move || {
         use std::io::{BufRead, BufReader};
@@ -527,11 +587,18 @@ fn spawn_tee_thread(
                 Ok(mut data) => {
                     // split() strips the delimiter — re-add newline for F tag
                     data.push(b'\n');
+                    // (a) CRI log — byte-identical to pre-fanout behavior.
                     let formatted = cri_log_line(stream_name, &data);
-                    let mut lg = log.lock().unwrap();
-                    if let Some(f) = lg.as_mut() {
-                        use std::io::Write;
-                        let _ = f.write_all(&formatted);
+                    {
+                        let mut lg = log.lock().unwrap();
+                        if let Some(f) = lg.as_mut() {
+                            use std::io::Write;
+                            let _ = f.write_all(&formatted);
+                        }
+                    }
+                    // (b) live attachers — receive the raw container bytes.
+                    if let Some(fo) = &fanout {
+                        fo.broadcast(stream_name, &data);
                     }
                 }
                 Err(_) => break,
@@ -882,15 +949,18 @@ impl CriBackend for FakeBackend {
         // setsid + optional UTS/mount namespaces for hostname and resolv.conf.
         install_container_pre_exec(&mut cmd, sandbox_hostname, resolv_conf_path);
 
-        // Tee: master fd carries all output (stdout+stderr merged on pty)
+        // Tee: master fd carries all output (stdout+stderr merged on pty).
+        // tty attach is served by duping the pty master (kernel-multiplexed),
+        // so no fan-out is needed here.
         let master_for_tee = dup_file(&master_file).map_err(BackendError::Io)?;
-        spawn_tee_thread("stdout", master_for_tee, Arc::clone(&log_shared));
+        spawn_tee_thread("stdout", master_for_tee, Arc::clone(&log_shared), None);
 
         let container_io = ContainerIo {
             pty_master: Some(master_file),
             stdout_rd: None,
             stderr_rd: None,
             stdin_wr: None,
+            fanout: None,
         };
 
         // ── Persist start intent (crash-only) ────────────────────────────────
@@ -1655,21 +1725,88 @@ impl CriBackend for FakeBackend {
                 waiter: Box::new(AttachWaiter),
             })
         } else {
-            // pipe mode (non-tty): the tee thread is the SOLE reader of the
-            // process read-ends (it writes the CRI log). Handing a dup of those
-            // read-ends to an attacher would make the two compete for bytes —
-            // each getting a random subset (cold-critic finding 2026-06-12).
-            // Correctly supporting pipe-mode attach needs an output fan-out
-            // (broadcast tee → log + N attachers), which is R2 work. Until then
-            // we return an honest error rather than a silently-wrong stream.
-            // (tty-mode attach above works: the pty master is duplicated by the
-            // kernel without this race, which is the kubectl-interactive case.)
-            let _ = (&entry.stdout_rd, &entry.stderr_rd, &entry.stdin_wr);
-            Err(BackendError::Internal(
-                "pipe-mode (non-tty) attach not supported (would race the log tee); \
-                 use a tty container or exec — R2: output fan-out"
-                    .to_string(),
-            ))
+            // pipe mode (non-tty): output fan-out. The per-stream tee threads
+            // are still the SOLE readers of the container's read-ends; here we
+            // register a fresh OS pipe per stream as an attacher sink, so the
+            // tee copies the container's raw bytes into our pipe in addition to
+            // the CRI log. There is NO second reader of the container fd, so no
+            // race with the log tee (the deferral reason is removed). The
+            // StreamSession's stdout/stderr are the READ-ends of those pipes
+            // (the streaming server reads them); stdin is a dup of the running
+            // container's stdin write-end so the attacher can type into it.
+            let fanout = entry.fanout.clone().ok_or_else(|| {
+                BackendError::Internal(
+                    "pipe-mode container has no output fan-out (started before fan-out support?)"
+                        .to_string(),
+                )
+            })?;
+
+            // stdout sink: register the write-end, hand back the read-end.
+            let stdout_attach = if entry.stdout_rd.is_some() {
+                let (rd, wr) = make_pipe().map_err(BackendError::Io)?;
+                fanout.stdout_sinks.lock().unwrap().push(wr);
+                Some(rd)
+            } else {
+                None
+            };
+
+            // stderr sink: same, only if the container has a stderr stream.
+            let stderr_attach = if entry.stderr_rd.is_some() {
+                let (rd, wr) = make_pipe().map_err(BackendError::Io)?;
+                fanout.stderr_sinks.lock().unwrap().push(wr);
+                Some(rd)
+            } else {
+                None
+            };
+
+            // stdin: dup the running container's stdin write-end (if it kept a
+            // stdin pipe, i.e. config.stdin=true) so the attacher feeds the
+            // LIVE process — exactly the pipe-mode attach contract.
+            let stdin_attach = match &entry.stdin_wr {
+                Some(w) => Some(dup_file(w).map_err(BackendError::Io)?),
+                None => None,
+            };
+
+            drop(io);
+
+            // Waiter: an attach session does not own the child. It completes
+            // when the container leaves Running (process exit) so the streaming
+            // server tears the session down. Subscriptions self-clean: once the
+            // attacher drops the read-ends, the next tee broadcast hits a broken
+            // pipe and prunes the sink (see FanOut::broadcast). No leak.
+            struct AttachWaiter {
+                cache: Arc<Mutex<Cache>>,
+                id: ContainerId,
+            }
+            impl ExitWaiter for AttachWaiter {
+                fn wait(self: Box<Self>) -> Result<i32> {
+                    loop {
+                        let code = {
+                            let cache = self.cache.lock().unwrap();
+                            match cache.containers.get(&self.id) {
+                                Some(r) if r.state == ContainerState::Running => None,
+                                Some(r) => Some(r.exit_code),
+                                None => Some(0), // removed underneath us
+                            }
+                        };
+                        if let Some(c) = code {
+                            return Ok(c);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                }
+            }
+
+            Ok(StreamSession {
+                stdin: stdin_attach,
+                stdout: stdout_attach,
+                stderr: stderr_attach,
+                pty_master: None,
+                waiter: Box::new(AttachWaiter {
+                    cache: Arc::clone(&self.cache),
+                    id: id.clone(),
+                }),
+            })
         }
     }
 
@@ -2028,12 +2165,22 @@ impl FakeBackend {
         let stderr_rd_for_table: Option<std::fs::File>;
         let stdin_wr_for_table: Option<std::fs::File>;
 
+        // One fan-out per container, shared by both stream tee threads (writers)
+        // and open_attach (registers attacher sinks). The tee threads remain the
+        // SOLE readers of the container's read-ends.
+        let fanout = Arc::new(FanOut::default());
+
         if let Some(stdout) = stdout_pipe {
             let raw = stdout.into_raw_fd();
             let f_for_tee = unsafe { std::fs::File::from_raw_fd(raw) };
             // dup for io_table (so tee thread can run independently)
             let f_for_table = dup_file(&f_for_tee).map_err(BackendError::Io)?;
-            spawn_tee_thread("stdout", f_for_tee, Arc::clone(&log_shared));
+            spawn_tee_thread(
+                "stdout",
+                f_for_tee,
+                Arc::clone(&log_shared),
+                Some(Arc::clone(&fanout)),
+            );
             stdout_rd_for_table = Some(f_for_table);
         } else {
             stdout_rd_for_table = None;
@@ -2043,7 +2190,12 @@ impl FakeBackend {
             let raw = stderr.into_raw_fd();
             let f_for_tee = unsafe { std::fs::File::from_raw_fd(raw) };
             let f_for_table = dup_file(&f_for_tee).map_err(BackendError::Io)?;
-            spawn_tee_thread("stderr", f_for_tee, Arc::clone(&log_shared));
+            spawn_tee_thread(
+                "stderr",
+                f_for_tee,
+                Arc::clone(&log_shared),
+                Some(Arc::clone(&fanout)),
+            );
             stderr_rd_for_table = Some(f_for_table);
         } else {
             stderr_rd_for_table = None;
@@ -2067,6 +2219,7 @@ impl FakeBackend {
                     stdout_rd: stdout_rd_for_table,
                     stderr_rd: stderr_rd_for_table,
                     stdin_wr: stdin_wr_for_table,
+                    fanout: Some(fanout),
                 },
             );
         }
