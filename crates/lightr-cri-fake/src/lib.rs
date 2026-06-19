@@ -170,6 +170,28 @@ pub struct FakeBackend {
 }
 
 impl FakeBackend {
+    /// Poll the cache until the container's detached reaper thread has recorded
+    /// the terminal (Exited) state, or `timeout` elapses. Returns true once the
+    /// container is no longer Running. The reaper (start_container) owns the real
+    /// exit_code; we only wait for it to land so stop is synchronous to callers.
+    fn wait_until_exited(&self, id: &ContainerId, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            {
+                let cache = self.cache.lock().unwrap();
+                match cache.containers.get(id) {
+                    Some(r) if r.state != ContainerState::Running => return true,
+                    None => return true, // removed underneath us
+                    _ => {}
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     /// Open (or create) the state root and rebuild the cache from disk.
     pub fn open(state_root: &Path) -> std::io::Result<Self> {
         let sandboxes_dir = state_root.join("sandboxes");
@@ -971,28 +993,6 @@ impl CriBackend for FakeBackend {
         });
 
         Ok(())
-    }
-
-    /// Poll the cache until the container's detached reaper thread has recorded
-    /// the terminal (Exited) state, or `timeout` elapses. Returns true once the
-    /// container is no longer Running. The reaper (start_container) owns the real
-    /// exit_code; we only wait for it to land so stop is synchronous to callers.
-    fn wait_until_exited(&self, id: &ContainerId, timeout: std::time::Duration) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            {
-                let cache = self.cache.lock().unwrap();
-                match cache.containers.get(id) {
-                    Some(r) if r.state != ContainerState::Running => return true,
-                    None => return true, // removed underneath us
-                    _ => {}
-                }
-            }
-            if std::time::Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
     }
 
     fn stop_container(&self, id: &ContainerId, grace_seconds: i64) -> Result<()> {
