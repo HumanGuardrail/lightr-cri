@@ -382,7 +382,7 @@ fn container_matches(rec: &ContainerRecord, filter: &ContainerFilter) -> bool {
     true
 }
 
-fn rec_to_status(rec: &ContainerRecord) -> ContainerStatus {
+fn rec_to_status(rec: &ContainerRecord, sandbox_log_dir: &str) -> ContainerStatus {
     // critest/CRI normalization (G1): for a terminal (Exited) container the
     // `reason` MUST be exactly "Completed" (exit_code == 0) or "Error" (any
     // non-zero exit, including signal-kill). The human-readable detail recorded
@@ -406,10 +406,21 @@ fn rec_to_status(rec: &ContainerRecord) -> ContainerStatus {
     } else {
         (rec.reason.clone(), rec.message.clone())
     };
+    // CRI: ContainerStatus.log_path is the ABSOLUTE path (sandbox log_directory
+    // joined with the container's relative ContainerConfig.log_path). crictl logs
+    // lstat()s this path directly, so a relative value yields "no such file".
+    // The record keeps the relative log_path (open_cri_log joins it itself).
+    let mut config = rec.config.clone();
+    if !config.log_path.is_empty() && !sandbox_log_dir.is_empty() {
+        config.log_path = std::path::Path::new(sandbox_log_dir)
+            .join(&config.log_path)
+            .to_string_lossy()
+            .into_owned();
+    }
     ContainerStatus {
         id: rec.id.clone(),
         sandbox: rec.sandbox.clone(),
-        config: rec.config.clone(),
+        config,
         state: rec.state,
         created_at_nanos: rec.created_at_nanos,
         started_at_nanos: rec.started_at_nanos,
@@ -1092,21 +1103,32 @@ impl CriBackend for FakeBackend {
 
     fn container_status(&self, id: &ContainerId) -> Result<ContainerStatus> {
         let cache = self.cache.lock().unwrap();
-        cache
+        let rec = cache
             .containers
             .get(id)
-            .map(rec_to_status)
-            .ok_or_else(|| BackendError::NotFound(format!("container {}", id.0)))
+            .ok_or_else(|| BackendError::NotFound(format!("container {}", id.0)))?;
+        let log_dir = cache
+            .sandboxes
+            .get(&rec.sandbox)
+            .map(|s| s.config.log_directory.clone())
+            .unwrap_or_default();
+        Ok(rec_to_status(rec, &log_dir))
     }
 
     fn list_containers(&self, filter: &ContainerFilter) -> Result<Vec<ContainerStatus>> {
         let cache = self.cache.lock().unwrap();
-        Ok(cache
-            .containers
-            .values()
-            .filter(|r| container_matches(r, filter))
-            .map(rec_to_status)
-            .collect())
+        let mut out = Vec::new();
+        for r in cache.containers.values() {
+            if container_matches(r, filter) {
+                let log_dir = cache
+                    .sandboxes
+                    .get(&r.sandbox)
+                    .map(|s| s.config.log_directory.clone())
+                    .unwrap_or_default();
+                out.push(rec_to_status(r, &log_dir));
+            }
+        }
+        Ok(out)
     }
 
     fn container_stats(&self, id: &ContainerId) -> Result<ContainerStatsRec> {

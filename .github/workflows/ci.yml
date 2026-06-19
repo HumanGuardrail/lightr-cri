@@ -149,12 +149,10 @@ jobs:
           echo "${KUBELET_CACHE}" >> "$GITHUB_PATH"
           echo "kubelet v1.33.13 cached at ${KUBELET_CACHE}/kubelet"
 
-      - name: cargo test --workspace (A9 vectors + fake + shell + acceptance A1–A8)
-        # Hosted ubuntu runs as non-root; netns/CNI tests need CAP_SYS_ADMIN.
-        # sudo -E preserves HOME/CARGO_HOME (toolchain resolves); env pins PATH
-        # past sudo's secure_path so ~/.cargo/bin cargo is found.
-        run: sudo -E env "PATH=$PATH" cargo test --workspace
-
+      # NOTE: A10 critest (the canonical k8s conformance gate) runs BEFORE the
+      # house cargo-test acceptance suite, so the real R1 conformance bar is
+      # always visible even while the heavier house streaming/networking b-tests
+      # are still being brought to green. cargo test --workspace runs last (below).
       - name: A10 critest gate
         run: sudo -E env "PATH=$PATH" bash ci/critest-gate.sh
 
@@ -169,6 +167,13 @@ jobs:
           LIGHTR_CRI_BIN: target/release/lightr-cri
           KUBELET_BIN: /tmp/kubelet-cache/kubelet
         run: sudo -E env "PATH=$PATH" bash ci/kubelet-smoke.sh
+
+      - name: cargo test --workspace (A9 vectors + fake + shell + acceptance A1–A8)
+        # Runs LAST: the canonical critest gate above is the R1 conformance bar;
+        # this house suite (incl. the heavier streaming/networking b-tests) is
+        # supplementary. Hosted ubuntu runs as non-root; netns/CNI tests need
+        # CAP_SYS_ADMIN — sudo -E preserves HOME/CARGO_HOME; env pins PATH.
+        run: sudo -E env "PATH=$PATH" cargo test --workspace
 
   # ── verify-codegen: regenerate proto, diff must be empty ─────────────────
   verify-codegen:
