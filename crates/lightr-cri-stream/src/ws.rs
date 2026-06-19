@@ -1,8 +1,15 @@
-//! WebSocket exec/attach (≤ v4) — r1-streaming.md item 3.
+//! WebSocket exec/attach (≤ v5) — r1-streaming.md item 3.
 //!
-//! Subprotocol negotiation from the allowed set (NOT v5):
+//! Subprotocol negotiation from the allowed set:
 //!   "", channel.k8s.io, base64.channel.k8s.io,
-//!   v4.channel.k8s.io, v4.base64.channel.k8s.io
+//!   v4.channel.k8s.io, v4.base64.channel.k8s.io,
+//!   v5.channel.k8s.io, v5.base64.channel.k8s.io
+//! v5 is wire-identical to v4 on the stream handler (apimachinery
+//! `streamProtocolV5` embeds `streamProtocolV4` and only delegates; v5's change
+//! is client-side close signaling, not framing). crictl v1.33's WebSocket
+//! executor (client-go `NewWebSocketExecutor`) offers ONLY `v5.channel.k8s.io`,
+//! so the server MUST select v5 to complete the handshake — it is then driven
+//! over the same channel framing and v4 metav1.Status exit delivery as v4.
 //! Binary subprotocols frame `[channel | payload]`; base64 subprotocols send
 //! an ASCII channel digit + standard-base64 payload over TEXT frames.
 //!
@@ -21,8 +28,12 @@ use crate::status;
 use crate::{SessionFactory, StreamParams, StreamVerb};
 
 /// The WS subprotocols this server accepts, in server-preference order
-/// (highest first). v5 is deliberately absent (server max = v4).
+/// (highest first). v5 is wire-identical to v4 (same channel framing + v4
+/// metav1.Status exit), so we select it when offered and drive the v4 path —
+/// crictl v1.33's WebSocket executor offers ONLY `v5.channel.k8s.io`.
 pub const ALLOWED_PROTOCOLS: &[&str] = &[
+    "v5.channel.k8s.io",
+    "v5.base64.channel.k8s.io",
     "v4.channel.k8s.io",
     "v4.base64.channel.k8s.io",
     "channel.k8s.io",
@@ -234,18 +245,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn negotiate_prefers_v4_binary() {
+    fn negotiate_prefers_v5_binary() {
+        // v5 is wire-identical to v4; server preference selects v5 when offered.
         let got = negotiate(Some("v5.channel.k8s.io, v4.channel.k8s.io, channel.k8s.io"));
-        assert_eq!(got, "v4.channel.k8s.io");
+        assert_eq!(got, "v5.channel.k8s.io");
     }
 
     #[test]
-    fn negotiate_never_picks_v5() {
-        // v5 offered but not in our allowed set → falls through to v4
-        let got = negotiate(Some("v5.channel.k8s.io,v4.channel.k8s.io"));
+    fn negotiate_picks_v5_alone() {
+        // crictl v1.33's WebSocket executor offers ONLY v5 — must be selected
+        // (returning "" would dead-end the gorilla/websocket client handshake).
+        assert_eq!(negotiate(Some("v5.channel.k8s.io")), "v5.channel.k8s.io");
+    }
+
+    #[test]
+    fn negotiate_falls_back_to_v4_when_no_v5() {
+        let got = negotiate(Some("v4.channel.k8s.io, channel.k8s.io"));
         assert_eq!(got, "v4.channel.k8s.io");
-        // v5 alone → empty (bare binary)
-        assert_eq!(negotiate(Some("v5.channel.k8s.io")), "");
     }
 
     #[test]
