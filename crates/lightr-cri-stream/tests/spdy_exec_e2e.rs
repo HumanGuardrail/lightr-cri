@@ -356,6 +356,65 @@ async fn run_exec_client(s: TcpStream, stdout_content_expected: usize) -> (Vec<u
     (stdout_buf, error_buf, all_replies_ok)
 }
 
+/// Drive an exec stream EXACTLY like client-go's remotecommand executor: open
+/// the error + stdout streams, then keep the write half OPEN (never
+/// `wr.shutdown()`, never TCP half-close) and block reading until the terminal
+/// Status arrives. This reproduces the deadlock path the `_pumps_stdout_*`
+/// tests mask by half-closing: client-go blocks in `wg.Wait()`/`<-errorChan`
+/// waiting for the SERVER to signal completion and never closes its write side
+/// first. Returns (stdout, error-stream bytes) or `None` on timeout.
+///
+/// `wr` is held (not dropped) for the whole read so the write half provably
+/// stays open — a dropped half would close the stream and could masquerade as
+/// the half-close we are trying to avoid.
+async fn run_exec_client_no_halfclose(
+    s: TcpStream,
+    stdout_content_expected: usize,
+    overall: Duration,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let mut comp = ClientComp::new(CANON_DICT);
+    let (mut rd, mut wr) = tokio::io::split(s);
+
+    let err_block = comp.compress(&serialize_headers(&[("streamType", "error")]));
+    wr.write_all(&syn_stream(STREAM_ERROR, &err_block))
+        .await
+        .expect("write err syn");
+    let out_block = comp.compress(&serialize_headers(&[("streamType", "stdout")]));
+    wr.write_all(&syn_stream(STREAM_STDOUT, &out_block))
+        .await
+        .expect("write out syn");
+    wr.flush().await.expect("flush syns");
+    // NOTE: deliberately NO `wr.shutdown()` here. `wr` is kept alive below.
+
+    let mut stdout_buf = Vec::new();
+    let mut error_buf = Vec::new();
+
+    let collect = async {
+        loop {
+            match read_frame(&mut rd).await {
+                Some(f) if !f.is_control => match f.stream_id {
+                    STREAM_STDOUT => stdout_buf.extend_from_slice(&f.payload),
+                    STREAM_ERROR => error_buf.extend_from_slice(&f.payload),
+                    _ => {}
+                },
+                Some(_) => {}
+                None => break, // server closed
+            }
+            if stdout_buf.len() >= stdout_content_expected && !error_buf.is_empty() {
+                break;
+            }
+        }
+    };
+
+    let result = tokio::time::timeout(overall, collect).await;
+    // Keep the write half open until AFTER we have the answer, then drop it.
+    drop(wr);
+    match result {
+        Ok(()) => Some((stdout_buf, error_buf)),
+        Err(_) => None, // timed out — the deadlock the fix repairs
+    }
+}
+
 // ── the real end-to-end tests ────────────────────────────────────────────────
 
 #[test]
@@ -429,6 +488,55 @@ async fn spdy_exec_success_status_on_zero_exit() {
     assert_eq!(stdout_buf, stdout_content);
     let status: serde_json::Value = serde_json::from_slice(&error_buf).expect("status json");
     assert_eq!(status["status"], "Success");
+
+    handle.shutdown().await;
+}
+
+/// Regression for the confirmed completion deadlock: the server MUST deliver
+/// the terminal v4 Status driven by CHILD-EXIT, NOT by the client closing its
+/// write half. This client never calls `wr.shutdown()` / never TCP half-closes
+/// (the real client-go path — it blocks waiting for the server's Status). If
+/// completion is (incorrectly) gated on the read-loop seeing transport close,
+/// nothing is ever written and this times out. The bounded timeout is the
+/// assertion: the Status must arrive well within it without any client close.
+#[tokio::test]
+async fn spdy_exec_completes_without_client_halfclose() {
+    let stdout_content: &[u8] = b"hello from exec\n";
+    let exit_code = 7;
+    let handle = serve(
+        "127.0.0.1:0".parse().unwrap(),
+        fixture_factory(stdout_content, exit_code),
+    )
+    .await
+    .unwrap();
+    let token = handle
+        .registry()
+        .mint(StreamVerb::Exec, exec_params())
+        .unwrap();
+    let addr = handle.base_url().trim_start_matches("http://").to_string();
+
+    let s = upgrade_spdy(&addr, &token).await;
+    // Bounded: a correct (reap-driven) server answers in milliseconds; the
+    // deadlocked server never answers and burns the whole 5s window.
+    let got = run_exec_client_no_halfclose(s, stdout_content.len(), Duration::from_secs(5)).await;
+
+    let (stdout_buf, error_buf) = got.expect(
+        "DEADLOCK: terminal Status never arrived without a client half-close — \
+         completion is still gated on transport close, not on child-exit",
+    );
+    assert_eq!(
+        stdout_buf, stdout_content,
+        "stdout was not pumped over the wire (no half-close path)"
+    );
+    assert!(
+        !error_buf.is_empty(),
+        "no v4 Status on the error stream without a client half-close"
+    );
+    let status: serde_json::Value =
+        serde_json::from_slice(&error_buf).expect("error stream is metav1.Status JSON");
+    assert_eq!(status["status"], "Failure");
+    assert_eq!(status["reason"], "NonZeroExitCode");
+    assert_eq!(status["details"]["causes"][0]["message"], "7");
 
     handle.shutdown().await;
 }

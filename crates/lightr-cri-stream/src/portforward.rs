@@ -131,7 +131,20 @@ pub async fn run_ws(mut socket: WebSocket, ports: Vec<u16>, dial_host: String) {
                             }
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Close(_))) | None => {
+                        // Client closed its side: propagate CloseWrite to every
+                        // connected backend as a TCP half-close (write-half
+                        // shutdown) so the backend sees EOF rather than an abrupt
+                        // reset. The backend→client (read) direction is already
+                        // handled by the read_any arm above; we only add the
+                        // client→backend half-close here.
+                        for conn in conns.values_mut() {
+                            if let Some(s) = conn.stream.as_mut() {
+                                let _ = s.shutdown().await;
+                            }
+                        }
+                        break;
+                    }
                     Some(Ok(_)) => {}
                     Some(Err(_)) => break,
                 }
