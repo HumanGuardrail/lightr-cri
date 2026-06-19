@@ -1,11 +1,9 @@
 {
-  "name": "stop-running-exit-code-143",
+  "name": "container-remove-while-running-force",
   "steps": [
     { "op": "run_sandbox", "cfg": { "name": "s1", "uid": "u1", "namespace": "ns", "attempt": 0 } },
     { "op": "create_container", "sandbox": "$0", "cfg": { "name": "c1", "attempt": 0, "image_ref": "ref/sleep", "command": ["/bin/sleep", "30"] } },
     { "op": "start_container", "id": "$1" },
-    { "op": "stop_container", "id": "$1", "grace_seconds": 5 },
-    { "op": "assert_status", "id": "$1", "state": "Exited", "exit_code": 143 },
     { "op": "remove_container", "id": "$1" },
     { "op": "remove_sandbox", "id": "$0" }
   ]

@@ -973,6 +973,28 @@ impl CriBackend for FakeBackend {
         Ok(())
     }
 
+    /// Poll the cache until the container's detached reaper thread has recorded
+    /// the terminal (Exited) state, or `timeout` elapses. Returns true once the
+    /// container is no longer Running. The reaper (start_container) owns the real
+    /// exit_code; we only wait for it to land so stop is synchronous to callers.
+    fn wait_until_exited(&self, id: &ContainerId, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            {
+                let cache = self.cache.lock().unwrap();
+                match cache.containers.get(id) {
+                    Some(r) if r.state != ContainerState::Running => return true,
+                    None => return true, // removed underneath us
+                    _ => {}
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     fn stop_container(&self, id: &ContainerId, grace_seconds: i64) -> Result<()> {
         let rec = {
             let cache = self.cache.lock().unwrap();
@@ -989,42 +1011,38 @@ impl CriBackend for FakeBackend {
         }
 
         // SIGTERM→SIGKILL law (seam-contract §Container plane):
-        //   grace > 0  → graceful: SIGTERM, wait up to grace, then SIGKILL.
-        //   grace == 0 → forced:   immediate SIGKILL, no SIGTERM window.
-        let (signaled_code, signaled_reason) = if grace_seconds > 0 {
-            if rec.pid > 0 {
+        //   grace > 0  → graceful: SIGTERM, wait up to grace for exit, then SIGKILL.
+        //   grace == 0 → forced:   immediate SIGKILL.
+        // The detached reaper thread (start_container) is the SINGLE source of
+        // truth for the terminal exit_code — it calls wait() and records the real
+        // status (128+15 for SIGTERM, 128+9 for SIGKILL). We only deliver signals
+        // and wait for the reaper to land the Exited state; we must NOT guess the
+        // code here (a just-signalled process is a zombie until reaped, so a
+        // liveness probe reads it as alive and would wrongly escalate SIGTERM→SIGKILL,
+        // mis-tagging a graceful 143 stop as a forced 137).
+        if rec.pid > 0 {
+            if grace_seconds > 0 {
                 unsafe {
                     libc::kill(rec.pid as libc::pid_t, libc::SIGTERM);
                 }
-                // Bounded SIGTERM window (cap the brief poll so tests stay fast);
-                // if the process is still alive after it, escalate to SIGKILL.
-                let grace = std::time::Duration::from_secs(grace_seconds as u64)
-                    .min(std::time::Duration::from_millis(100));
-                std::thread::sleep(grace);
-                if pid_alive(rec.pid) {
+                let grace = std::time::Duration::from_secs(grace_seconds as u64);
+                if !self.wait_until_exited(id, grace) {
                     unsafe {
                         libc::kill(rec.pid as libc::pid_t, libc::SIGKILL);
                     }
-                    (128 + 9, "stopped".to_string()) // SIGKILL
-                } else {
-                    (128 + 15, "stopped".to_string()) // SIGTERM
+                    self.wait_until_exited(id, std::time::Duration::from_secs(5));
                 }
             } else {
-                (128 + 15, "stopped".to_string())
-            }
-        } else {
-            // Forced stop: straight to SIGKILL.
-            if rec.pid > 0 {
                 unsafe {
                     libc::kill(rec.pid as libc::pid_t, libc::SIGKILL);
                 }
+                self.wait_until_exited(id, std::time::Duration::from_secs(5));
             }
-            (128 + 9, "stopped".to_string()) // SIGKILL
-        };
+            return Ok(());
+        }
 
-        // Mark terminal state. The detached reaper thread (start_container) owns
-        // the Child handle and calls wait() — the SIGKILL above lets that wait()
-        // return, reaping the process (no zombie) and dropping io_table fds.
+        // Defensive: a Running record with no backing process (pid 0) has no
+        // reaper to fire, so record the terminal state directly here.
         let finished_at = now_nanos();
         {
             let mut cache = self.cache.lock().unwrap();
@@ -1032,13 +1050,12 @@ impl CriBackend for FakeBackend {
                 if entry.state == ContainerState::Running {
                     entry.state = ContainerState::Exited;
                     entry.finished_at_nanos = finished_at;
-                    entry.exit_code = signaled_code;
-                    entry.reason = signaled_reason;
+                    entry.exit_code = if grace_seconds > 0 { 128 + 15 } else { 128 + 9 };
+                    entry.reason = "stopped".to_string();
                     let rec_clone = entry.clone();
                     drop(cache);
                     let filename = format!("{}.json", id.0);
                     atomic_write_json(&self.containers_dir, &filename, &rec_clone)?;
-                    return Ok(());
                 }
             }
         }

@@ -249,14 +249,13 @@ Runner: `run_vectors(backend: &dyn CriBackend, dir: &Path) -> VectorReport`.
 Vector JSON shape (frozen):
 
 ```json
-{ "name": "container-remove-while-running-refused",
+{ "name": "container-remove-while-running-force",
   "steps": [
     {"op": "run_sandbox", "cfg": {"name": "s1", "uid": "u1", "namespace": "ns", "attempt": 0}},
     {"op": "create_container", "sandbox": "$0", "cfg": {"name": "c1", "image_ref": "ref/a", "command": ["/bin/sleep", "5"]}},
     {"op": "start_container", "id": "$1"},
-    {"op": "remove_container", "id": "$1", "expect_err": "FailedPrecondition"},
-    {"op": "stop_container", "id": "$1", "grace_seconds": 0},
-    {"op": "remove_container", "id": "$1"}
+    {"op": "remove_container", "id": "$1"},
+    {"op": "remove_sandbox", "id": "$0"}
   ] }
 ```
 

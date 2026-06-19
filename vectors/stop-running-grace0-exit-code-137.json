@@ -1,11 +1,11 @@
 {
-  "name": "container-remove-while-running-refused",
+  "name": "stop-running-grace0-exit-code-137",
   "steps": [
     { "op": "run_sandbox", "cfg": { "name": "s1", "uid": "u1", "namespace": "ns", "attempt": 0 } },
     { "op": "create_container", "sandbox": "$0", "cfg": { "name": "c1", "attempt": 0, "image_ref": "ref/sleep", "command": ["/bin/sleep", "30"] } },
     { "op": "start_container", "id": "$1" },
-    { "op": "remove_container", "id": "$1", "expect_err": "FailedPrecondition" },
     { "op": "stop_container", "id": "$1", "grace_seconds": 0 },
+    { "op": "assert_status", "id": "$1", "state": "Exited", "exit_code": 137 },
     { "op": "remove_container", "id": "$1" },
     { "op": "remove_sandbox", "id": "$0" }
   ]
