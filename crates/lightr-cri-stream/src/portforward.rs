@@ -1,8 +1,10 @@
 //! PortForward — WebSocket (legacy channel) + the shared TCP dial/pipe used by
 //! both WS and SPDY paths (r1-streaming.md items 2 & 4).
 //!
-//! The streamer dials `StreamParams.dial_target:<port>` (contract §B: pod IP,
-//! or 127.0.0.1 for host_network). WS framing: ports from the `?port=` query;
+//! The streamer dials the backend per contract §B (AMENDED 2026-06-19): INSIDE
+//! the sandbox netns at `127.0.0.1:<port>` when `StreamParams.netns_path` is
+//! recorded, else the host-netns dial of `StreamParams.dial_target:<port>`
+//! (host_network). WS framing: ports from the `?port=` query;
 //! 2 channels per port (2i = data RW, 2i+1 = error W); the FIRST 2 bytes the
 //! server writes on EACH channel are the port number as u16 LITTLE-endian.
 
@@ -32,9 +34,29 @@ pub fn parse_ports(query: &str) -> Vec<u16> {
     out
 }
 
-/// Dial the target host:port for a forwarded connection.
-pub async fn dial(host: &str, port: u16) -> std::io::Result<TcpStream> {
-    TcpStream::connect((host, port)).await
+/// Dial the target host:port for a forwarded connection. With `netns_path =
+/// Some`, the connect runs INSIDE the sandbox network namespace (contract §B
+/// AMENDED 2026-06-19): `lightr_cri_net::netns::dial_in_netns` performs the
+/// `setns` + blocking `std::net` connect on a DEDICATED thread (never a tokio
+/// worker — `setns` mutates the calling thread's netns) and hands the connected
+/// `std::TcpStream` back; we adopt it as a tokio stream. The blocking
+/// cross-thread `join()` is moved off the runtime via `spawn_blocking`.
+/// `None` (host_network) keeps the ordinary host-netns dial.
+pub async fn dial(host: &str, port: u16, netns_path: Option<&str>) -> std::io::Result<TcpStream> {
+    match netns_path {
+        None => TcpStream::connect((host, port)).await,
+        Some(ns) => {
+            let ns = ns.to_string();
+            let host = host.to_string();
+            let std_sock = tokio::task::spawn_blocking(move || {
+                lightr_cri_net::netns::dial_in_netns(&ns, &host, port)
+            })
+            .await
+            .map_err(|e| std::io::Error::other(format!("dial_in_netns join: {e}")))??;
+            std_sock.set_nonblocking(true)?;
+            TcpStream::from_std(std_sock)
+        }
+    }
 }
 
 /// One forwarded port pairing: the target port plus a lazily-dialed TCP stream.
@@ -66,7 +88,12 @@ async fn read_any(
 /// WS portforward: ports come from the query, channels are 2-per-port. We
 /// support a single active port pairing per connection at a time (the common
 /// crictl/kubectl case) but route by channel for any number of declared ports.
-pub async fn run_ws(mut socket: WebSocket, ports: Vec<u16>, dial_host: String) {
+pub async fn run_ws(
+    mut socket: WebSocket,
+    ports: Vec<u16>,
+    dial_host: String,
+    netns_path: Option<String>,
+) {
     if ports.is_empty() {
         let _ = socket.send(Message::Close(None)).await;
         return;
@@ -112,7 +139,7 @@ pub async fn run_ws(mut socket: WebSocket, ports: Vec<u16>, dial_host: String) {
                         if ch % 2 == 0 {
                             if let Some(conn) = conns.get_mut(ch) {
                                 if conn.stream.is_none() {
-                                    match dial(&dial_host, conn.port).await {
+                                    match dial(&dial_host, conn.port, netns_path.as_deref()).await {
                                         Ok(s) => conn.stream = Some(s),
                                         Err(_) => {
                                             // signal failure on the error channel

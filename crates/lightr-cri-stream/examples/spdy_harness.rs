@@ -61,6 +61,7 @@ async fn main() {
                 stdin: false,
                 ports: vec![],
                 dial_target: None,
+                netns_path: None,
             },
         )
         .unwrap();

@@ -134,6 +134,7 @@ mod tests {
             stdin: true,
             ports: vec![],
             dial_target: None,
+            netns_path: None,
         }
     }
 
