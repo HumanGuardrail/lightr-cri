@@ -84,10 +84,6 @@ should output OOMKilled reason  # reason → R2
 # requires real namespace sharing; fake does not implement). R2.
 Multiple Containers  # reason → R2
 
-# Remove running container (force-remove) — fake refuses FailedPrecondition.
-# Conquerable once force-stop semantics are settled. FLAGGED.
-runtime should support removing running container  # reason → R2
-
 # PodSandbox sysctls — needs real Linux kernel sysctl namespace. R2.
 should support.*sysctls  # reason → R2
 runtime should support sysctls  # reason → R2

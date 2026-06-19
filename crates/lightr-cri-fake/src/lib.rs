@@ -361,6 +361,29 @@ fn container_matches(rec: &ContainerRecord, filter: &ContainerFilter) -> bool {
 }
 
 fn rec_to_status(rec: &ContainerRecord) -> ContainerStatus {
+    // critest/CRI normalization (G1): for a terminal (Exited) container the
+    // `reason` MUST be exactly "Completed" (exit_code == 0) or "Error" (any
+    // non-zero exit, including signal-kill). The human-readable detail recorded
+    // internally (e.g. "killed-by-signal-15", "stopped", "lost-exit-…") is
+    // preserved in `message` so no information is lost. Because BOTH
+    // container_status and list_containers read through this single function,
+    // the two paths are guaranteed to agree on the normalized reason.
+    let (reason, message) = if rec.state == ContainerState::Exited {
+        let normalized = if rec.exit_code == 0 {
+            "Completed"
+        } else {
+            "Error"
+        };
+        // Keep the raw reason as the human detail when no explicit message was set.
+        let message = if rec.message.is_empty() {
+            rec.reason.clone()
+        } else {
+            rec.message.clone()
+        };
+        (normalized.to_string(), message)
+    } else {
+        (rec.reason.clone(), rec.message.clone())
+    };
     ContainerStatus {
         id: rec.id.clone(),
         sandbox: rec.sandbox.clone(),
@@ -370,8 +393,8 @@ fn rec_to_status(rec: &ContainerRecord) -> ContainerStatus {
         started_at_nanos: rec.started_at_nanos,
         finished_at_nanos: rec.finished_at_nanos,
         exit_code: rec.exit_code,
-        reason: rec.reason.clone(),
-        message: rec.message.clone(),
+        reason,
+        message,
     }
 }
 
@@ -950,7 +973,7 @@ impl CriBackend for FakeBackend {
         Ok(())
     }
 
-    fn stop_container(&self, id: &ContainerId, _grace_seconds: i64) -> Result<()> {
+    fn stop_container(&self, id: &ContainerId, grace_seconds: i64) -> Result<()> {
         let rec = {
             let cache = self.cache.lock().unwrap();
             match cache.containers.get(id) {
@@ -965,20 +988,43 @@ impl CriBackend for FakeBackend {
             ContainerState::Unknown => return Ok(()),
         }
 
-        // Send SIGTERM/SIGKILL to the process
-        if rec.pid > 0 {
-            unsafe {
-                libc::kill(rec.pid as libc::pid_t, libc::SIGTERM);
+        // SIGTERM→SIGKILL law (seam-contract §Container plane):
+        //   grace > 0  → graceful: SIGTERM, wait up to grace, then SIGKILL.
+        //   grace == 0 → forced:   immediate SIGKILL, no SIGTERM window.
+        let (signaled_code, signaled_reason) = if grace_seconds > 0 {
+            if rec.pid > 0 {
+                unsafe {
+                    libc::kill(rec.pid as libc::pid_t, libc::SIGTERM);
+                }
+                // Bounded SIGTERM window (cap the brief poll so tests stay fast);
+                // if the process is still alive after it, escalate to SIGKILL.
+                let grace = std::time::Duration::from_secs(grace_seconds as u64)
+                    .min(std::time::Duration::from_millis(100));
+                std::thread::sleep(grace);
+                if pid_alive(rec.pid) {
+                    unsafe {
+                        libc::kill(rec.pid as libc::pid_t, libc::SIGKILL);
+                    }
+                    (128 + 9, "stopped".to_string()) // SIGKILL
+                } else {
+                    (128 + 15, "stopped".to_string()) // SIGTERM
+                }
+            } else {
+                (128 + 15, "stopped".to_string())
             }
-            // Give a brief moment, then SIGKILL
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            if pid_alive(rec.pid) {
+        } else {
+            // Forced stop: straight to SIGKILL.
+            if rec.pid > 0 {
                 unsafe {
                     libc::kill(rec.pid as libc::pid_t, libc::SIGKILL);
                 }
             }
-        }
+            (128 + 9, "stopped".to_string()) // SIGKILL
+        };
 
+        // Mark terminal state. The detached reaper thread (start_container) owns
+        // the Child handle and calls wait() — the SIGKILL above lets that wait()
+        // return, reaping the process (no zombie) and dropping io_table fds.
         let finished_at = now_nanos();
         {
             let mut cache = self.cache.lock().unwrap();
@@ -986,8 +1032,8 @@ impl CriBackend for FakeBackend {
                 if entry.state == ContainerState::Running {
                     entry.state = ContainerState::Exited;
                     entry.finished_at_nanos = finished_at;
-                    entry.exit_code = 128 + 15; // SIGTERM
-                    entry.reason = "stopped".to_string();
+                    entry.exit_code = signaled_code;
+                    entry.reason = signaled_reason;
                     let rec_clone = entry.clone();
                     drop(cache);
                     let filename = format!("{}.json", id.0);
@@ -1000,24 +1046,26 @@ impl CriBackend for FakeBackend {
     }
 
     fn remove_container(&self, id: &ContainerId) -> Result<()> {
-        {
+        // CRI law: RemoveContainer force-removes even a Running container — it
+        // is not a FailedPrecondition. If still Running, force-stop first
+        // (grace=0 → SIGKILL via the same stop path), then remove.
+        let is_running = {
             let cache = self.cache.lock().unwrap();
             match cache.containers.get(id) {
                 None => return Ok(()), // idempotent: already gone
-                Some(r) if r.state == ContainerState::Running => {
-                    return Err(BackendError::FailedPrecondition(format!(
-                        "container {} is Running; stop it first",
-                        id.0
-                    )));
-                }
-                _ => {}
+                Some(r) => r.state == ContainerState::Running,
             }
+        };
+        if is_running {
+            // Reuse stop_container with grace=0 (forced SIGKILL + reap by the
+            // detached reaper thread); idempotent and leak-free.
+            self.stop_container(id, 0)?;
         }
         {
             let mut cache = self.cache.lock().unwrap();
             cache.containers.remove(id);
         }
-        // Clean up io_table entry if present
+        // Clean up io_table entry if present (drops any retained log/io fds).
         self.io_table.lock().unwrap().remove(id);
         let filename = format!("{}.json", id.0);
         let path = self.containers_dir.join(&filename);
@@ -1127,6 +1175,43 @@ impl CriBackend for FakeBackend {
         }
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
+
+        // §D: join the container child's namespaces so the exec process sees the
+        // container's synthesized /etc/resolv.conf (mnt) and hostname (uts), plus
+        // the sandbox netns. Order: mnt + uts first, then net (registered last so
+        // it runs last in pre_exec). Without this, critest's `cat /etc/resolv.conf`
+        // and `hostname` via ExecSync read the HOST values and fail.
+        #[cfg(target_os = "linux")]
+        {
+            join_container_mnt_uts(&mut command, id, rec.pid)?;
+
+            let netns_path_opt: Option<String> = {
+                let cache = self.cache.lock().unwrap();
+                cache
+                    .sandboxes
+                    .get(&rec.sandbox)
+                    .and_then(|s| s.netns_path.clone())
+            };
+            if let Some(ref path_str) = netns_path_opt {
+                let ns_fd = lightr_cri_net::netns::join_netns(std::path::Path::new(path_str))
+                    .map_err(|e| {
+                        BackendError::Internal(format!("exec_sync join_netns {path_str}: {e}"))
+                    })?;
+                unsafe {
+                    use std::os::unix::io::IntoRawFd;
+                    use std::os::unix::process::CommandExt;
+                    let raw_fd = ns_fd.into_raw_fd();
+                    command.pre_exec(move || {
+                        let rc = libc::setns(raw_fd, libc::CLONE_NEWNET);
+                        libc::close(raw_fd);
+                        if rc != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+        }
 
         let mut child = command
             .spawn()
@@ -1345,6 +1430,11 @@ impl CriBackend for FakeBackend {
         // or CNI unavailable), exec runs on the host network as before.
         #[cfg(target_os = "linux")]
         {
+            // Join the container child's mnt + uts namespaces first (so exec sees
+            // the container's /etc/resolv.conf and hostname), then the netns below.
+            // Registration order == pre_exec run order: mnt+uts before net.
+            join_container_mnt_uts(&mut command, id, rec.pid)?;
+
             let netns_path_opt: Option<String> = {
                 let cache = self.cache.lock().unwrap();
                 cache
@@ -1740,6 +1830,77 @@ fn install_container_pre_exec(
         let _ = hostname;
         let _ = resolv_conf_src;
     }
+}
+
+/// Register a `pre_exec` closure on `cmd` that joins the container child's
+/// PRIVATE mount + UTS namespaces (the ones `install_container_pre_exec`
+/// unshared) so an exec process sees the container's synthesized
+/// `/etc/resolv.conf` and `hostname` instead of the host values.
+///
+/// The container's mnt/uts namespaces are not bind-mounted to a pinned path
+/// (only the netns is, via CNI); they live behind the live pause-loop PID.
+/// We therefore open `/proc/<container_pid>/ns/{mnt,uts}` in the PARENT
+/// (before fork) as `OwnedFd` — reusing `netns::join_netns`, which is just an
+/// `O_RDONLY` open returning an `OwnedFd` — and `setns()` them in `pre_exec`
+/// (async-signal-safe: fds opened pre-fork, only `setns`/`close` after fork).
+///
+/// Order matters: mnt + uts are joined BEFORE the caller registers the netns
+/// join, so the full namespace set (mnt, uts, net) is entered before exec.
+///
+/// Fail-closed: if either ns file can't be opened (container process gone) we
+/// return a `FailedPrecondition` "not Running" error rather than silently
+/// running on the host namespaces.
+#[cfg(target_os = "linux")]
+fn join_container_mnt_uts(
+    cmd: &mut std::process::Command,
+    id: &ContainerId,
+    container_pid: u32,
+) -> Result<()> {
+    if container_pid == 0 {
+        return Err(BackendError::FailedPrecondition(format!(
+            "container {} is not Running (no live pid); exec requires Running",
+            id.0
+        )));
+    }
+
+    let mnt_path = format!("/proc/{container_pid}/ns/mnt");
+    let uts_path = format!("/proc/{container_pid}/ns/uts");
+
+    // Open the ns fds in the parent (before fork) and move the OwnedFds into the
+    // pre_exec closure — reusing the same open→OwnedFd→setns pattern as the
+    // netns join. If the process is gone, fail closed with "not Running".
+    let mnt_fd = lightr_cri_net::netns::join_netns(std::path::Path::new(&mnt_path)).map_err(|_| {
+        BackendError::FailedPrecondition(format!(
+            "container {} is not Running (mnt namespace unavailable); exec requires Running",
+            id.0
+        ))
+    })?;
+    let uts_fd = lightr_cri_net::netns::join_netns(std::path::Path::new(&uts_path)).map_err(|_| {
+        BackendError::FailedPrecondition(format!(
+            "container {} is not Running (uts namespace unavailable); exec requires Running",
+            id.0
+        ))
+    })?;
+
+    unsafe {
+        use std::os::unix::io::IntoRawFd;
+        use std::os::unix::process::CommandExt;
+        let mnt_raw = mnt_fd.into_raw_fd();
+        let uts_raw = uts_fd.into_raw_fd();
+        cmd.pre_exec(move || {
+            // Join mnt first, then uts. Both before the netns join (registered
+            // later by the caller). We own both fds; close them regardless.
+            let rc_mnt = libc::setns(mnt_raw, libc::CLONE_NEWNS);
+            let rc_uts = libc::setns(uts_raw, libc::CLONE_NEWUTS);
+            libc::close(mnt_raw);
+            libc::close(uts_raw);
+            if rc_mnt != 0 || rc_uts != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2159,7 +2320,9 @@ mod tests {
     }
 
     #[test]
-    fn container_remove_while_running_refused() {
+    fn container_remove_while_running_force_removes() {
+        // CRI law: RemoveContainer must succeed on a Running container —
+        // it force-stops (SIGKILL) then removes. No FailedPrecondition.
         let (_dir, backend) = tmp_backend();
         let sb = backend.run_sandbox(minimal_sandbox_cfg("sb")).unwrap();
         let mut cfg = minimal_container_cfg("c");
@@ -2168,10 +2331,9 @@ mod tests {
         let cid = backend.create_container(&sb, cfg).unwrap();
         backend.start_container(&cid).unwrap();
 
-        let err = backend.remove_container(&cid).unwrap_err();
-        assert!(matches!(err, BackendError::FailedPrecondition(_)));
-
-        backend.stop_container(&cid, 0).unwrap();
+        // Direct remove of a Running container succeeds (force-remove).
+        backend.remove_container(&cid).unwrap();
+        // And it is gone: a second remove is a no-op (idempotent).
         backend.remove_container(&cid).unwrap();
     }
 
