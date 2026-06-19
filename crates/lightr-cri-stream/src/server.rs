@@ -197,6 +197,13 @@ fn spdy_exec_upgrade(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
+    if std::env::var_os("LIGHTR_SPDY_TRACE").is_some() {
+        eprintln!("SPDY_TRACE upgrade verb={verb:?} x-stream-protocol-version={proto_hdr:?}");
+        for (k, v) in req.headers() {
+            eprintln!("SPDY_TRACE req_hdr {k}: {v:?}");
+        }
+    }
+
     let negotiated = match proto_hdr.as_deref() {
         Some(h) => match spdy::negotiate_exec_protocol(h) {
             Some(p) => p,
