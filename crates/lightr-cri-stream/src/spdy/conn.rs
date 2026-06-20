@@ -189,6 +189,15 @@ pub async fn run_exec<S>(
     // hold raw output files until their stream is opened
     let stdout_raw = session.as_mut().and_then(|s| s.stdout.take());
     let stderr_raw = session.as_mut().and_then(|s| s.stderr.take());
+    // Whether the SESSION actually provides each output file. A pump is spawned
+    // ONLY when the client opens the role AND the session has the file (read-loop
+    // SynStream arm). The drain-readiness gate below must size itself to the
+    // pumps that WILL spawn — counting a stderr pump that can never exist (e.g.
+    // `stderr: None`, stderr merged onto the pty, or a stdout-only session) makes
+    // the gate wait out its full backstop, stalling completion and starving the
+    // stdout bytes / the terminal Status (the spdy_exec_e2e regression).
+    let has_stdout_file = stdout_raw.is_some();
+    let has_stderr_file = stderr_raw.is_some();
     let waiter = session.map(|s| s.waiter);
 
     // Routing/output state that BOTH the concurrent read-loop and the
@@ -481,9 +490,22 @@ pub async fn run_exec<S>(
             }
         };
         let mut detached_fired = false;
-        tokio::select! {
-            _ = tokio::time::timeout(std::time::Duration::from_secs(5), barrier) => {}
-            _ = &mut detached => { detached_fired = true; }
+        if is_attach {
+            // ATTACH: a client may detach before it opens its full stream set, so
+            // race the barrier against the detach signal and bail to teardown.
+            tokio::select! {
+                _ = tokio::time::timeout(std::time::Duration::from_secs(5), barrier) => {}
+                _ = &mut detached => { detached_fired = true; }
+            }
+        } else {
+            // EXEC: the client closing its WRITE half (the TCP half-close after
+            // it finishes sending SYN_STREAMs / stdin) is NOT a detach — client-go
+            // keeps its READ half OPEN to receive stdout and the terminal Status.
+            // Short-circuiting on that loop-end EOF here skips the output drain and
+            // truncates stdout (the spdy_exec_e2e regression). So exec NEVER bails
+            // on detach; it always runs reaper + drain. `detached` is left unpolled
+            // so it stays valid for the completion select's safety arm below.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), barrier).await;
         }
 
         // 0b. Drain-readiness gate (TTY-exec output-delivery fix). The barrier
@@ -503,8 +525,15 @@ pub async fn run_exec<S>(
         //     Skip when already detached (nothing left to drain for the client).
         if !detached_fired {
             let expected_pumps = {
-                // stdout always; stderr only when NOT tty (merged onto the pty).
-                if params.tty { 1 } else { 2 }
+                // Count ONLY pumps that will actually spawn: one per output role
+                // the client opens (stdout always; stderr only when NOT tty —
+                // matching `expected_roles` / client-go's createStreams) that the
+                // session ALSO has a file for. A session with `stderr: None`
+                // (stderr merged onto the pty, or stdout-only) yields a single
+                // pump; gating on a fixed 2 would hang on the absent stderr pump.
+                let stdout = has_stdout_file as usize;
+                let stderr = (!params.tty && has_stderr_file) as usize;
+                stdout + stderr
             };
             let pump_gate = async {
                 loop {
@@ -516,9 +545,16 @@ pub async fn run_exec<S>(
                 }
             };
             tokio::pin!(pump_gate);
-            tokio::select! {
-                _ = tokio::time::timeout(std::time::Duration::from_secs(5), pump_gate) => {}
-                _ = &mut detached => { detached_fired = true; }
+            if is_attach {
+                tokio::select! {
+                    _ = tokio::time::timeout(std::time::Duration::from_secs(5), pump_gate) => {}
+                    _ = &mut detached => { detached_fired = true; }
+                }
+            } else {
+                // EXEC: as above, never bail on detach — wait for the pumps to
+                // register (bounded) so the drain has them, keeping `detached`
+                // valid for the completion select.
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), pump_gate).await;
             }
         }
 
@@ -573,7 +609,14 @@ pub async fn run_exec<S>(
                         let _ = drain.await;
                     }
                     _ = &mut drain => {}
-                    _ = &mut detached => {}
+                    _ = &mut detached => {
+                        // The client closed its WRITE side (half-close) — but for
+                        // exec it keeps its READ side open for stdout + the Status.
+                        // STILL drain every output byte before the Status so a
+                        // half-closing client receives the full stdout; the exit
+                        // code is awaited from the reaper below.
+                        let _ = drain.await;
+                    }
                 }
             }
         }

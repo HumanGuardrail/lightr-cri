@@ -738,6 +738,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "lightr-cri-backend",
+ "lightr-cri-net",
  "serde",
  "serde_json",
  "tokio",
