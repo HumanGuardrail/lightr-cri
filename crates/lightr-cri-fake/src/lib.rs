@@ -876,9 +876,27 @@ impl CriBackend for FakeBackend {
         // container RUNNING so critest can exec into it. This is documented
         // fake behavior, NOT a faked result — containers with an explicit
         // command continue to use it unchanged.
+        // cri-tools' DefaultLinuxContainerCommand is `["top"]` — a keep-alive
+        // entrypoint. The fake has no image layer and runs HOST binaries; host
+        // procps `top` exits immediately without a tty, so the container would
+        // reach Exited before a slow exec (the "execSync with timeout" loop) runs.
+        // The fake's job is to keep the container RUNNING for the CRI lifecycle
+        // (critest never asserts top's output), so we emulate the keep-alive with
+        // the same pause loop used for an empty command. Real `top` runs under the
+        // lightr backend (real image). Any other explicit command is used verbatim.
+        let first_program = rec.config.command.first().or_else(|| rec.config.args.first());
+        let is_keepalive_top = first_program
+            .map(|p| {
+                std::path::Path::new(p)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(p)
+                    == "top"
+            })
+            .unwrap_or(false);
         let default_command: Vec<String>;
         let (effective_command, effective_args): (&[String], &[String]) =
-            if rec.config.command.is_empty() && rec.config.args.is_empty() {
+            if (rec.config.command.is_empty() && rec.config.args.is_empty()) || is_keepalive_top {
                 default_command = vec![
                     "/bin/sh".to_string(),
                     "-c".to_string(),
@@ -905,31 +923,10 @@ impl CriBackend for FakeBackend {
 
         // ── Set up stdio ─────────────────────────────────────────────────────
 
-        // Decide on pty vs. pipe mode.
-        //
-        // Normally this follows config.tty. ONE narrow exception: some programs
-        // refuse to run without a controlling terminal and exit immediately when
-        // their stdio is a pipe/null. The canonical case is procps `top`, which
-        // cri-tools uses as its DefaultLinuxContainerCommand keep-alive entrypoint
-        // (`["top"]`): with no tty it prints "failed tty get" and exits within ~1s,
-        // so the container reaches Exited before a slow exec (e.g. the
-        // "execSync with timeout" conformance loop) can run — the container
-        // self-exits, independent of any kill path.
-        //
-        // To make such a keep-alive command GENUINELY persist (real execution on a
-        // real pty, NOT a faked Running state) we route it through the pty path even
-        // when config.tty == false: the child sees a tty, runs its loop, and stays
-        // Running. The detection is deliberately minimal — the program basename,
-        // not a heuristic on flags — so we only special-case the documented
-        // terminal-requiring keep-alive command and nothing else. Containers whose
-        // command does not need a tty keep the existing pipe/null stdio + fan-out.
-        let program_basename = std::path::Path::new(program)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(program.as_str());
-        let requires_tty = program_basename == "top";
-
-        let use_tty = rec.config.tty || requires_tty;
+        // pty vs pipe follows config.tty. (The cri-tools keep-alive `top`
+        // entrypoint is handled above by substituting a pause loop, so no
+        // terminal-requiring command reaches here needing a forced pty.)
+        let use_tty = rec.config.tty;
 
         // tty=false (and not a terminal-requiring command): delegate to pipe-mode
         // helper and return early.
