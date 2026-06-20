@@ -68,9 +68,13 @@ export IMAGE_SERVICE_ENDPOINT="unix://${SOCKET}"
 
 now_ns() { date +%s%N; }
 
-# Spawn the server; return once it answers its first CRI RPC. Echoes the
-# spawn→first-RPC latency in milliseconds on stdout.
-start_and_time() {
+# Spawn the server in the CURRENT shell (NOT a command-substitution subshell —
+# that would not propagate SERVER_PID back to the parent, leaking the process and
+# colliding on the socket). Returns 0 once the server answers its first CRI RPC,
+# and writes the spawn→first-RPC latency (ms) into the global LAST_MS. Returns 1
+# (not a hard die) on startup failure so the caller can decide.
+LAST_MS=""
+start_server_timed() {
   local t0 t1
   t0="$(now_ns)"
   "${SERVER_BIN}" --socket "${SOCKET}" --state "${STATE_DIR}" >/dev/null 2>&1 &
@@ -79,13 +83,14 @@ start_and_time() {
   for _ in $(seq 1 600); do
     if crictl version >/dev/null 2>&1; then
       t1="$(now_ns)"
-      echo "$(( (t1 - t0) / 1000000 ))"
+      LAST_MS=$(( (t1 - t0) / 1000000 ))
       return 0
     fi
-    kill -0 "${SERVER_PID}" 2>/dev/null || die "server died during startup"
+    kill -0 "${SERVER_PID}" 2>/dev/null || { note "server died during startup"; return 1; }
     sleep 0.05
   done
-  die "server did not answer an RPC within 30s"
+  note "server did not answer an RPC within 30s"
+  return 1
 }
 
 stop_server() {
@@ -113,8 +118,8 @@ stats() {
 note "cold-start × ${COLD_SAMPLES} …"
 cold_file="${TMP_DIR}/cold.txt"; : > "${cold_file}"
 for _ in $(seq 1 "${COLD_SAMPLES}"); do
-  ms="$(start_and_time)"
-  echo "${ms}" >> "${cold_file}"
+  start_server_timed || die "cold-start failed (server never answered)"
+  echo "${LAST_MS}" >> "${cold_file}"
   stop_server
   rm -rf "${STATE_DIR}"; mkdir -p "${STATE_DIR}"   # fresh state each cold run
 done
@@ -123,7 +128,7 @@ note "cold-start ms: min=${cold_min} p50=${cold_p50} max=${cold_max}"
 
 # ── 2. IDLE RSS + daemonless footprint (warm server) ─────────────────────────
 note "idle footprint …"
-start_and_time >/dev/null
+start_server_timed || die "idle-footprint: server never answered"
 # Warm up: one pod lifecycle so RSS reflects a real working set, then settle.
 POD_JSON="${TMP_DIR}/pod.json"
 cat > "${POD_JSON}" <<'JSON'
@@ -136,13 +141,15 @@ RSS_KB="$(ps -o rss= -p "${SERVER_PID}" | tr -d ' ')"
 THREADS="$(ps -o nlwp= -p "${SERVER_PID}" 2>/dev/null | tr -d ' ' || echo null)"
 # Daemonless proof: how many long-lived runtime processes exist. lightr-cri is
 # the single serve process — there is no separate daemon tree.
-PROC_COUNT="$(pgrep -c -f "$(basename "${SERVER_BIN}") --socket ${SOCKET}" 2>/dev/null || echo 1)"
+PROC_COUNT="$( { pgrep -f "$(basename "${SERVER_BIN}") --socket ${SOCKET}" 2>/dev/null || true; } | wc -l | tr -d ' ')"
 note "idle RSS=${RSS_KB} KB  threads=${THREADS}  runtime_procs=${PROC_COUNT}"
 
 # ── 3. CRASH-RECOVERY: kill -9 → restart → serving, state re-derived ─────────
 note "crash-recovery × ${RECOVERY_SAMPLES} …"
 rec_file="${TMP_DIR}/rec.txt"; : > "${rec_file}"
-rederive_ok=true
+# Only claim re-derivation if there is actually a pod to re-derive; otherwise
+# report "untested" rather than a hollow "true".
+if [ -n "${POD_ID:-}" ]; then rederive_ok=true; else rederive_ok=untested; fi
 for _ in $(seq 1 "${RECOVERY_SAMPLES}"); do
   # Hard-kill the live server (crash-only law: no graceful shutdown).
   kill -9 "${SERVER_PID}" 2>/dev/null || true
@@ -150,8 +157,8 @@ for _ in $(seq 1 "${RECOVERY_SAMPLES}"); do
   SERVER_PID=""
   rm -f "${SOCKET}"
   # Restart on the SAME socket+state and time to first answered RPC.
-  ms="$(start_and_time)"
-  echo "${ms}" >> "${rec_file}"
+  start_server_timed || die "crash-recovery: server did not come back"
+  echo "${LAST_MS}" >> "${rec_file}"
   # Re-derivation proof: the pod created before the crash must still list,
   # rebuilt from disk/kernel — nothing was kept in the dead process.
   if [ -n "${POD_ID:-}" ] && ! crictl pods -q 2>/dev/null | grep -q "${POD_ID:0:12}"; then
@@ -204,7 +211,7 @@ cat > "${BENCH_OUT}" <<JSON
   "in_scope": {
     "cold_start_ms":     { "n": ${COLD_SAMPLES},     "min": $(j "${cold_min}"), "p50": $(j "${cold_p50}"), "max": $(j "${cold_max}"), "definition": "spawn -> first answered CRI RPC" },
     "idle_rss_kb":       { "value": $(j "${RSS_KB}"), "threads": $(j "${THREADS}"), "runtime_processes": $(j "${PROC_COUNT}"), "definition": "VmRSS of the serve process after one pod lifecycle" },
-    "crash_recovery_ms": { "n": ${RECOVERY_SAMPLES}, "min": $(j "${rec_min}"), "p50": $(j "${rec_p50}"), "max": $(j "${rec_max}"), "state_rederived": ${rederive_ok}, "definition": "kill -9 -> restart same socket+state -> first answered RPC" }
+    "crash_recovery_ms": { "n": ${RECOVERY_SAMPLES}, "min": $(j "${rec_min}"), "p50": $(j "${rec_p50}"), "max": $(j "${rec_max}"), "state_rederived": "${rederive_ok}", "definition": "kill -9 -> restart same socket+state -> first answered RPC" }
   },
   "reference": {
     "containerd_idle_rss_kb": $(j "${ctd_rss}"),
@@ -216,6 +223,14 @@ cat > "${BENCH_OUT}" <<JSON
   }
 }
 JSON
+
+# Self-validate the signed artifact: a malformed JSON must FAIL the step, not
+# pass with a hollow file (jq is present in CI — used by the critest gate).
+if command -v jq >/dev/null 2>&1; then
+  jq -e . "${BENCH_OUT}" >/dev/null || die "emitted bench JSON is malformed: ${BENCH_OUT}"
+elif [ "${REQUIRE_PROBES}" = "1" ]; then
+  die "jq not found and LIGHTR_CRI_REQUIRE_PROBES=1 (cannot validate signed JSON)"
+fi
 
 note "signed → ${BENCH_OUT}"
 echo "──────── lightr-cri bench (signed) ────────"
