@@ -236,7 +236,7 @@ pub async fn run_exec<S>(
     // drain / detach) and is NOT itself what completes the session. The loop
     // keeps draining stdin + resize + ping for as long as the client stays
     // connected, and signals `client_closed` when the client tears down.
-    let read_loop = {
+    let mut read_loop = {
         let writer = writer.clone();
         let by_role = by_role.clone();
         let output_tasks = output_tasks.clone();
