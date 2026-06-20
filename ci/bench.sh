@@ -173,25 +173,31 @@ note "crash-recovery ms: min=${rec_min} p50=${rec_p50} max=${rec_max}  state_red
 stop_server
 
 # ── 4. REFERENCE (labeled): containerd idle daemon RSS ───────────────────────
-ctd_rss="null"; ctd_note="containerd not present — reference skipped"
-if command -v containerd >/dev/null 2>&1; then
-  CTD_ROOT="${TMP_DIR}/ctd-root"; CTD_STATE="${TMP_DIR}/ctd-state"
-  CTD_SOCK="${TMP_DIR}/ctd.sock"
+# Prefer the containerd daemon ALREADY RUNNING on the runner (the Docker system
+# service) — its live idle RSS on the SAME host is the most honest reference, and
+# needs no hand-started daemon. Fall back to starting a throwaway one only if no
+# containerd is running. Either way this is a LABELED reference, not a verdict.
+ctd_rss="null"; ctd_note="no containerd daemon found — reference skipped"
+ctd_pid="$( { pgrep -x containerd 2>/dev/null || true; } | head -1 )"
+ctd_src="system service"
+if [ -z "${ctd_pid}" ] && command -v containerd >/dev/null 2>&1; then
+  # No running daemon — start a throwaway one in tmp dirs to sample idle RSS.
+  CTD_ROOT="${TMP_DIR}/ctd-root"; CTD_STATE="${TMP_DIR}/ctd-state"; CTD_SOCK="${TMP_DIR}/ctd.sock"
   mkdir -p "${CTD_ROOT}" "${CTD_STATE}"
-  containerd --root "${CTD_ROOT}" --state "${CTD_STATE}" \
-    --address "${CTD_SOCK}" >/dev/null 2>&1 &
-  CTD_PID=$!
+  containerd --root "${CTD_ROOT}" --state "${CTD_STATE}" --address "${CTD_SOCK}" >/dev/null 2>&1 &
+  CTD_OWN_PID=$!
   for _ in $(seq 1 100); do [ -S "${CTD_SOCK}" ] && break; sleep 0.05; done
   sleep 0.5
-  if kill -0 "${CTD_PID}" 2>/dev/null; then
-    ctd_rss="$(ps -o rss= -p "${CTD_PID}" | tr -d ' ')"
-    ctd_note="idle containerd daemon RSS — REFERENCE ONLY; workloads differ (containerd does far more at idle)"
-  fi
-  kill "${CTD_PID}" 2>/dev/null || true; wait "${CTD_PID}" 2>/dev/null || true
-  note "reference: containerd idle RSS=${ctd_rss} KB"
-else
-  note "reference: ${ctd_note}"
+  kill -0 "${CTD_OWN_PID}" 2>/dev/null && ctd_pid="${CTD_OWN_PID}"
+  ctd_src="throwaway (no system daemon was running)"
 fi
+if [ -n "${ctd_pid}" ]; then
+  rss_raw="$(ps -o rss= -p "${ctd_pid}" 2>/dev/null | tr -d ' ' || true)"
+  case "${rss_raw}" in (''|*[!0-9]*) : ;; (*) ctd_rss="${rss_raw}"
+    ctd_note="idle containerd daemon RSS (${ctd_src}) — REFERENCE ONLY; workloads differ (containerd does far more at idle)";; esac
+fi
+[ -n "${CTD_OWN_PID:-}" ] && { kill "${CTD_OWN_PID}" 2>/dev/null || true; wait "${CTD_OWN_PID}" 2>/dev/null || true; }
+note "reference: containerd idle RSS=${ctd_rss} KB (${ctd_src})"
 
 # ── 5. SIGN: emit the JSON artifact ──────────────────────────────────────────
 GIT_SHA="${GITHUB_SHA:-$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)}"
