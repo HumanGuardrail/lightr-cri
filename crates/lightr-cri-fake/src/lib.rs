@@ -1405,15 +1405,32 @@ impl CriBackend for FakeBackend {
                     }
                     None => {
                         if std::time::Instant::now() >= deadline {
-                            // Timeout: SIGKILL the whole process group (the child is
-                            // its own group leader) so a forked grandchild can't keep
-                            // the stdout pipe open and wedge the call; then reap so no
-                            // zombie survives.
+                            // Timeout. critest's sleepCmd is a *direct* exec
+                            // (`["sleep", "4321"]`, cri-tools v1.33
+                            // pkg/validate/consts.go: sleepLinuxCmd) — no shell, so
+                            // the exec child IS the `sleep` process itself, and
+                            // checkSleepCmd (`sh -c "pgrep sleep || true"`) flags ANY
+                            // surviving `sleep`. We must guarantee it dies and is
+                            // reaped before returning.
+                            //
+                            // Kill in two ways, most-reliable first:
+                            //  1. SIGKILL the child PID directly. This always reaches
+                            //     the `sleep` even if `process_group(0)` failed to
+                            //     establish pgid==pid (in which case kill(-pid) would
+                            //     hit the server's own group / ESRCH and MISS the
+                            //     sleep — the cause of the leftover-pgrep failure).
+                            //  2. SIGKILL the negative pgid as well, to sweep any
+                            //     forked grandchildren for shell-wrapped exec variants.
                             #[cfg(unix)]
                             unsafe {
-                                libc::kill(-(child.id() as i32), libc::SIGKILL);
+                                let pid = child.id() as i32;
+                                libc::kill(pid, libc::SIGKILL);
+                                libc::kill(-pid, libc::SIGKILL);
                             }
                             let _ = child.kill();
+                            // Blocking reap: collect the dead child so no zombie
+                            // survives and pgrep sees nothing afterwards. The pipes
+                            // are dropped with `child`, so no buffer can wedge us.
                             let _ = child.wait();
                             return Err(BackendError::Internal("exec timeout".to_string()));
                         }
