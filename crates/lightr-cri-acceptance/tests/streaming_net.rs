@@ -682,12 +682,62 @@ fn b5_hostport() {
         .arg("http://127.0.0.1:12000/")
         .output()
         .expect("curl hostPort");
+
+    // ── DIAGNOSTIC (failure path only) ──────────────────────────────────────
+    // On refusal/timeout we cannot tell from the exit code whether portmap
+    // created the wrong DNAT, no DNAT, or whether route_localnet/MASQ is the
+    // gap. Dump exactly what the portmap CNI plugin installed so the next CI
+    // run is conclusive. Cheap, runs ONLY when curl already failed.
+    let mut diag = String::new();
+    if !curl_out.status.success() {
+        let run = |args: &[&str]| -> String {
+            match std::process::Command::new("sudo").args(args).output() {
+                Ok(o) => format!(
+                    "$ sudo {}\n{}{}",
+                    args.join(" "),
+                    trim(&o.stdout),
+                    {
+                        let e = trim(&o.stderr);
+                        if e.is_empty() { String::new() } else { format!("\n[stderr] {e}") }
+                    }
+                ),
+                Err(e) => format!("$ sudo {} -> spawn error: {e}", args.join(" ")),
+            }
+        };
+        diag.push_str("\n──────── B5 DNAT DIAGNOSTIC ────────\n");
+        // The full nat ruleset portmap built: DNAT chains + the per-mapping
+        // -d 127.0.0.1 --dport 12000 rule must appear under CNI-HOSTPORT-DNAT,
+        // hooked from BOTH PREROUTING and OUTPUT. Its absence => portmap never
+        // got the pod IP from prevResult (forwardPorts skipped).
+        diag.push('\n');
+        diag.push_str(&run(&["iptables", "-t", "nat", "-S"]));
+        diag.push('\n');
+        diag.push_str(&run(&["iptables", "-t", "nat", "-L", "-n", "-v"]));
+        diag.push('\n');
+        // route_localnet on the candidate egress ifaces (all / lo / cni0).
+        diag.push_str(&run(&[
+            "sysctl",
+            "net.ipv4.conf.all.route_localnet",
+            "net.ipv4.conf.lo.route_localnet",
+            "net.ipv4.conf.cni0.route_localnet",
+        ]));
+        diag.push('\n');
+        // What address the host actually routes 127.0.0.1:12000 through, and
+        // the bridge/veth state so we can confirm the pod IP is up.
+        diag.push_str(&run(&["ip", "-br", "addr"]));
+        diag.push('\n');
+        diag.push_str(&run(&["ip", "route", "get", "127.0.0.1"]));
+        diag.push_str("\n──────── END DIAGNOSTIC ────────\n");
+        eprintln!("{diag}");
+    }
+
     assert!(
         curl_out.status.success(),
-        "B5: curl http://127.0.0.1:12000/ failed (exit {})\nstdout: {}\nstderr: {}",
+        "B5: curl http://127.0.0.1:12000/ failed (exit {})\nstdout: {}\nstderr: {}{}",
         curl_out.status,
         trim(&curl_out.stdout),
         trim(&curl_out.stderr),
+        diag,
     );
     let body = trim(&curl_out.stdout);
     assert!(
