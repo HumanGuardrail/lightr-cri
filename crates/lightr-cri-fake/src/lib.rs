@@ -852,8 +852,10 @@ impl CriBackend for FakeBackend {
             )));
         }
 
-        // Fetch the sandbox record to get log_directory, dns, hostname.
-        let (sandbox_log_dir, sandbox_dns, sandbox_hostname) = {
+        // Fetch the sandbox record to get log_directory, dns, hostname, and the
+        // recorded netns_path (Some when the sandbox is not host_network and CNI
+        // created a netns; None for host_network or no-CNI sandboxes).
+        let (sandbox_log_dir, sandbox_dns, sandbox_hostname, sandbox_netns_path) = {
             let cache = self.cache.lock().unwrap();
             cache
                 .sandboxes
@@ -863,10 +865,14 @@ impl CriBackend for FakeBackend {
                         s.config.log_directory.clone(),
                         s.config.dns.clone(),
                         s.config.hostname.clone(),
+                        s.netns_path.clone(),
                     )
                 })
                 .unwrap_or_default()
         };
+        // netns join is Linux-only; on macOS the recorded path is not consumed.
+        #[cfg(not(target_os = "linux"))]
+        let _ = &sandbox_netns_path;
 
         // §D resolv.conf synthesis: if the sandbox has dns config, write a
         // per-sandbox resolv.conf into the state dir so pre_exec can bind-mount
@@ -977,6 +983,11 @@ impl CriBackend for FakeBackend {
                 sandbox_hostname.clone(),
                 resolv_conf_path.clone(),
             );
+            // §D: join the container MAIN process into the sandbox netns so an
+            // in-container server binds the CNI IP (mirrors exec_sync/open_exec).
+            // No-op (host netns unchanged) when netns_path is None.
+            #[cfg(target_os = "linux")]
+            join_container_netns(&mut cmd, &sandbox_netns_path)?;
             return self.start_container_pipe_mode(id, rec, cmd, sandbox_log_dir, log_shared);
         }
 
@@ -1000,6 +1011,11 @@ impl CriBackend for FakeBackend {
 
         // setsid + optional UTS/mount namespaces for hostname and resolv.conf.
         install_container_pre_exec(&mut cmd, sandbox_hostname, resolv_conf_path);
+        // §D: join the container MAIN process into the sandbox netns so an
+        // in-container server binds the CNI IP (mirrors exec_sync/open_exec).
+        // No-op (host netns unchanged) when netns_path is None.
+        #[cfg(target_os = "linux")]
+        join_container_netns(&mut cmd, &sandbox_netns_path)?;
 
         // Tee: master fd carries all output (stdout+stderr merged on pty).
         // tty attach is served by duping the pty master (kernel-multiplexed),
@@ -2094,6 +2110,47 @@ fn install_container_pre_exec(
         let _ = hostname;
         let _ = resolv_conf_src;
     }
+}
+
+/// Register a `pre_exec` closure on `cmd` that joins the container MAIN process
+/// into the sandbox's network namespace (the one CNI created and pinned at
+/// `netns_path`), so an in-container server binds the sandbox CNI IP instead of
+/// the host netns. This mirrors the netns-join in `exec_sync`/`open_exec`: the
+/// netns file is opened in the PARENT (before fork) as an `OwnedFd` and
+/// `setns(CLONE_NEWNET)` is called in `pre_exec` (async-signal-safe — fd opened
+/// pre-fork, only `setns`/`close` after fork).
+///
+/// When `netns_path` is `None` (host_network sandbox, or no CNI) this is a
+/// no-op and the child keeps the host netns — preserving the prior behavior.
+///
+/// The netns join is independent of the UTS/mount-namespace work that
+/// `install_container_pre_exec` registers (CLONE_NEWNET vs CLONE_NEWUTS/NEWNS),
+/// so registration order relative to it does not matter.
+#[cfg(target_os = "linux")]
+fn join_container_netns(
+    cmd: &mut std::process::Command,
+    netns_path: &Option<String>,
+) -> Result<()> {
+    if let Some(path_str) = netns_path {
+        let ns_fd = lightr_cri_net::netns::join_netns(std::path::Path::new(path_str))
+            .map_err(|e| {
+                BackendError::Internal(format!("start_container join_netns {path_str}: {e}"))
+            })?;
+        unsafe {
+            use std::os::unix::io::IntoRawFd;
+            use std::os::unix::process::CommandExt;
+            let raw_fd = ns_fd.into_raw_fd();
+            cmd.pre_exec(move || {
+                let rc = libc::setns(raw_fd, libc::CLONE_NEWNET);
+                libc::close(raw_fd);
+                if rc != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Register a `pre_exec` closure on `cmd` that joins the container child's
