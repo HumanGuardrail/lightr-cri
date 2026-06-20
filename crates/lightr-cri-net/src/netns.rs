@@ -64,6 +64,15 @@ fn create_on_thread(path: &Path) -> io::Result<()> {
     )
     .map_err(|e| io::Error::other(format!("bind-mount netns: {e}")))?;
 
+    // Bring the loopback interface UP inside the new netns. A fresh netns has
+    // `lo` DOWN by default, so dialing 127.0.0.1 inside it (the port-forward
+    // in-netns dial) would never connect → timeout. This thread is in the new
+    // netns (post-unshare), so a child process forked here runs in it too.
+    // (`ip` = iproute2, installed on the runner; non-fatal if it can't run.)
+    let _ = std::process::Command::new("ip")
+        .args(["link", "set", "lo", "up"])
+        .status();
+
     Ok(())
 }
 

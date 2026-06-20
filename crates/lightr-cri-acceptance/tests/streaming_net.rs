@@ -598,7 +598,9 @@ fn b5_hostport() {
         "containerPort": 80,
         "hostPort": 12000,
         "hostIp": "127.0.0.1",
-        "protocol": "TCP"
+        // crictl's pod-config loader wants the Protocol ENUM as its integer
+        // (0=TCP), not the string "TCP" (json: cannot unmarshal string into v1.Protocol).
+        "protocol": 0
     }]);
     let json = serde_json::json!({
         "metadata": { "name": "b5-pod", "uid": "b5-uid-0001", "namespace": "acceptance-b", "attempt": 0 },
