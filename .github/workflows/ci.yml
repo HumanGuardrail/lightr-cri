@@ -99,6 +99,11 @@ jobs:
           # the server + test steps (Actions step PATH can be restricted).
           echo "/usr/sbin" >> "$GITHUB_PATH"
           PATH="/usr/sbin:$PATH" command -v iptables
+          # hostPort DNAT to a loopback hostIP (127.0.0.1) only routes when
+          # route_localnet is enabled — otherwise the DNAT rule is skipped for
+          # martian 127.0.0.0/8 traffic and curl 127.0.0.1:<hostPort> is refused
+          # (b5_hostport). Real nodes set this for hostPort; enable it on the runner.
+          sudo sysctl -w net.ipv4.conf.all.route_localnet=1
 
       - name: install CNI plugins v1.9.1 and kubelet v1.33.13 (pinned sha256)
         run: |
