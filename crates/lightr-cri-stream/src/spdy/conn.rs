@@ -28,6 +28,44 @@ use crate::channel as ch;
 use crate::status;
 use crate::{SessionFactory, StreamParams, StreamVerb};
 
+/// Abort-on-drop ownership of a set of spawned tasks.
+///
+/// Plain `JoinHandle`s do NOT abort their task when dropped — a `run_exec`
+/// future cancelled by an outer session-duration cap would drop its handles
+/// and leave the read-loop + output pumps RUNNING, holding the socket open
+/// forever (the 57-min hang the cap could not bound). Registering every
+/// spawned task's `AbortHandle` here makes the cap real: when `run_exec`
+/// returns OR its future is dropped, this guard's `Drop` aborts them all, the
+/// last `Writer` Arc clone and the read half `rd` are released, and the
+/// connection tears down. On the normal path the tasks have already finished
+/// (or are explicitly aborted) before the guard drops, so the aborts are
+/// no-ops.
+/// Shared list of every spawned task's `AbortHandle`. The read-loop pushes
+/// the output pumps' handles as the client opens stdout/stderr streams; the
+/// function pushes the read-loop and reaper handles up front. A `std::sync`
+/// mutex (never held across an `.await`) keeps it cheap to touch from `Drop`.
+type AbortList = Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>;
+
+struct TaskGuard {
+    handles: AbortList,
+}
+
+impl TaskGuard {
+    fn new(handles: AbortList) -> Self {
+        Self { handles }
+    }
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        if let Ok(list) = self.handles.lock() {
+            for h in list.iter() {
+                h.abort();
+            }
+        }
+    }
+}
+
 /// Shared write side: the upgraded stream + the (server→client) header
 /// compressor, behind one mutex so frame writes are atomic.
 struct Writer<W> {
@@ -160,6 +198,17 @@ pub async fn run_exec<S>(
     // right streams and to await the right pumps. Shared behind a mutex.
     let by_role = Arc::new(Mutex::new(by_role));
     let output_tasks = Arc::new(Mutex::new(Vec::<tokio::task::JoinHandle<()>>::new()));
+
+    // Abort-on-drop ownership of EVERY task this function spawns (read-loop,
+    // output pumps, reaper). The guard lives on this future's stack: if the
+    // future is dropped (e.g. an outer session-duration cap fires), the guard
+    // drops too and aborts all registered tasks — releasing the read half `rd`
+    // and the last `Writer` Arc clones so the socket actually closes. Without
+    // this, dropped `JoinHandle`s leave the tasks running and the cap cannot
+    // tear the session down. The read-loop pushes each output pump's handle as
+    // streams open (shared `abort_list`), so pumps are covered too.
+    let abort_list: AbortList = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _guard = TaskGuard::new(abort_list.clone());
     // Fired by the read-loop after every `by_role` insert, so the completion
     // path can wait for the client's output/error stream ids to land instead
     // of racing a fast-exiting child (see the fast-exit barrier below).
@@ -185,6 +234,7 @@ pub async fn run_exec<S>(
         let output_tasks = output_tasks.clone();
         let role_added = role_added.clone();
         let client_closed = client_closed.clone();
+        let abort_list = abort_list.clone();
         tokio::spawn(async move {
             let mut roles = roles;
             let mut stdin = stdin;
@@ -230,19 +280,30 @@ pub async fn run_exec<S>(
                         // When an output stream opens, spawn its pump.
                         if role == ch::STDOUT {
                             if let Some(file) = stdout_raw.take() {
-                                output_tasks.lock().await.push(spawn_output(
+                                let h = spawn_output(
                                     writer.clone(),
                                     stream_id,
                                     bridge::adopt(file),
-                                ));
+                                );
+                                // Register for abort-on-drop BEFORE handing the
+                                // handle to the drain list, so a cap that fires
+                                // mid-stream aborts this pump too.
+                                if let Ok(mut l) = abort_list.lock() {
+                                    l.push(h.abort_handle());
+                                }
+                                output_tasks.lock().await.push(h);
                             }
                         } else if role == ch::STDERR {
                             if let Some(file) = stderr_raw.take() {
-                                output_tasks.lock().await.push(spawn_output(
+                                let h = spawn_output(
                                     writer.clone(),
                                     stream_id,
                                     bridge::adopt(file),
-                                ));
+                                );
+                                if let Ok(mut l) = abort_list.lock() {
+                                    l.push(h.abort_handle());
+                                }
+                                output_tasks.lock().await.push(h);
                             }
                         }
                     }
@@ -291,6 +352,12 @@ pub async fn run_exec<S>(
             client_closed.notify_waiters();
         })
     };
+    // Own the read-loop for abort-on-drop. Dropping `run_exec` (session cap)
+    // now aborts this task, releasing the read half `rd` and its `Writer` Arc
+    // clone — the socket can finally close.
+    if let Ok(mut l) = abort_list.lock() {
+        l.push(read_loop.abort_handle());
+    }
 
     // ── completion driven by OUTPUT-DRAIN or DETACH, not transport close ──
     //
@@ -310,7 +377,14 @@ pub async fn run_exec<S>(
     // concurrently throughout.
     if let Some(waiter) = waiter {
         let is_attach = verb == StreamVerb::Attach;
-        let reaper = tokio::task::spawn_blocking(move || waiter.wait());
+        let mut reaper = tokio::task::spawn_blocking(move || waiter.wait());
+        // Own the reaper too: if `run_exec` is dropped before the reaper
+        // resolves, abort it so it cannot linger past the cap. (A blocking
+        // wait already in progress can't be force-cancelled, but the handle is
+        // released; the attach path also explicitly aborts it below.)
+        if let Ok(mut l) = abort_list.lock() {
+            l.push(reaper.abort_handle());
+        }
 
         // Arm the detach signal ONCE, up front, and reuse the SAME future in
         // both selects below. `Notify::notified()` only observes a
@@ -354,17 +428,30 @@ pub async fn run_exec<S>(
             _ = &mut detached => { detached_fired = true; }
         }
 
-        // 1. PRIMARY completion trigger: drain stdout/stderr to EOF, raced
-        //    against a client-initiated detach. The output pumps run until
-        //    their file hits EOF (the process/container closed its end);
-        //    client-go expects every stdout/stderr byte to precede the v4
-        //    Status on the error stream. We AWAIT (not abort) the pumps so a
-        //    fast-exiting process's tail bytes are not truncated. A concurrent
-        //    `client_closed` (detach) wins the race when the client tears down
-        //    first — for attach this is the normal completion path.
-        //    If the client already detached during the barrier phase, `detached`
-        //    is resolved and must not be polled again (a completed `Notified`
-        //    panics on re-poll); skip straight to teardown in that case.
+        // 1. COMPLETION SELECT — the FIRST of three triggers wins (mirroring
+        //    ws.rs run_session's drive-off-drain shape, extended for SPDY's
+        //    concurrent reaper):
+        //      - REAPER resolves: process/exec exit. EXEC's normal path — gives
+        //        the real exit code for the Status. The exec client-go keeps
+        //        its write half OPEN until it reads the Status, so it never
+        //        detaches early; the reaper fires first (closing-first here
+        //        would deadlock exec — a previously-fixed bug, so the reaper
+        //        trigger is preserved).
+        //      - DRAIN: all output pumps reach EOF. For exec this coincides
+        //        with process exit; for attach it is container/pty exit. We
+        //        AWAIT (not abort) the pumps so a fast-exiting process's tail
+        //        bytes are not truncated before the Status.
+        //      - DETACH: the client closed its side. For attach this is the
+        //        normal completion path (the container outlives the session);
+        //        for exec it is an aborted client.
+        //    The reaper arm is included ONLY for exec: for attach the
+        //    `AttachWaiter` never fires while the container lives, so racing it
+        //    would just sit idle (and we must not block on it) — attach
+        //    completes via DRAIN (container exit) or DETACH instead.
+        //
+        //    `detached` may already be resolved from the barrier phase; a
+        //    completed `Notified` panics on re-poll, so skip the select then.
+        let mut reaped: Option<i32> = None;
         if !detached_fired {
             let drain = async {
                 let tasks = std::mem::take(&mut *output_tasks.lock().await);
@@ -372,20 +459,42 @@ pub async fn run_exec<S>(
                     let _ = t.await;
                 }
             };
-            tokio::select! {
-                _ = drain => {}
-                _ = &mut detached => {}
+            // `drain` is a fresh async block (Unpin not guaranteed) → pin it.
+            // `reaper` is a `JoinHandle`, which is `Unpin`, so `&mut reaper`
+            // polls fine without pinning and the handle survives the select for
+            // the abort/await below.
+            tokio::pin!(drain);
+            if is_attach {
+                tokio::select! {
+                    _ = &mut drain => {}
+                    _ = &mut detached => {}
+                }
+            } else {
+                tokio::select! {
+                    // EXEC: reaper-first is the dominant path; drain coincides.
+                    r = &mut reaper => {
+                        reaped = Some(r.unwrap_or(Ok(-1)).unwrap_or(-1));
+                        // The process exited; let any tail output flush before
+                        // the Status so client-go sees every byte first.
+                        let _ = drain.await;
+                    }
+                    _ = &mut drain => {}
+                    _ = &mut detached => {}
+                }
             }
         }
 
         // Exit code for the Status. Exec: the reaper's real code → Success /
-        // Failure+NonZeroExitCode. Attach has no meaningful exit code (the
-        // container outlives the session) → emit Status{Success} (exit 0) and
-        // do NOT block on the reaper, which would hang until the container
-        // itself exits; abort it instead.
+        // Failure+NonZeroExitCode (already captured if the reaper arm won;
+        // otherwise await it now that output drained). Attach has no meaningful
+        // exit code (the container outlives the session) → Status{Success}
+        // (exit 0) and do NOT block on the reaper, which would hang until the
+        // container itself exits; abort it instead.
         let exit = if is_attach {
             reaper.abort();
             0
+        } else if let Some(code) = reaped {
+            code
         } else {
             reaper.await.unwrap_or(Ok(-1)).unwrap_or(-1)
         };
@@ -421,7 +530,12 @@ pub async fn run_exec<S>(
 
     // Completion has been signalled (or there was no process to reap). The
     // client's subsequent conn.Close once it reads the Status is a benign
-    // normal end; we no longer need the read-loop, so let it wind down.
+    // normal end; we no longer need the read-loop, so wind it down explicitly
+    // (the NORMAL teardown path). The output pumps have already drained/aborted
+    // above and the reaper has resolved or been aborted. `_guard` then drops at
+    // function end and aborts the whole registered set again — a no-op now, but
+    // the SAME drop runs if `run_exec`'s future is cancelled before reaching
+    // here (session cap), which is what makes the cap actually tear down.
     read_loop.abort();
     let _ = read_loop.await;
 }
