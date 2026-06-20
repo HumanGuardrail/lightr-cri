@@ -50,8 +50,6 @@ cleanup() {
   rm -rf "${TMP_DIR}"
 }
 trap cleanup EXIT
-# Diagnostic: pinpoint the exact failing command/line under set -e (temporary).
-trap 'rc=$?; echo "bench: ERR rc=${rc} at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
 
 die()  { echo "bench: FATAL: $*" >&2; exit 1; }
 note() { echo "bench: $*" >&2; }
@@ -112,12 +110,11 @@ stats() {
       n=NR
       if (n==0) { print "null,null,null"; exit }
       p=int((n+1)/2); if (p<1) p=1
-      printf "%d,%d,%d", a[1], a[p], a[n]
+      printf "%d,%d,%d\n", a[1], a[p], a[n]
     }'
 }
 
 # ── 1. COLD-START: spawn → first answered RPC ────────────────────────────────
-set -x  # TEMPORARY diagnostic trace — remove once the bench step is green
 note "cold-start × ${COLD_SAMPLES} …"
 cold_file="${TMP_DIR}/cold.txt"; : > "${cold_file}"
 for _ in $(seq 1 "${COLD_SAMPLES}"); do
@@ -126,7 +123,9 @@ for _ in $(seq 1 "${COLD_SAMPLES}"); do
   stop_server
   rm -rf "${STATE_DIR}"; mkdir -p "${STATE_DIR}"   # fresh state each cold run
 done
-IFS=',' read -r cold_min cold_p50 cold_max < <(stats < "${cold_file}")
+# `read` returns non-zero on EOF-without-trailing-newline even when it fills the
+# vars; stats now emits a newline, and `|| true` keeps set -e from tripping on it.
+IFS=',' read -r cold_min cold_p50 cold_max < <(stats < "${cold_file}") || true
 note "cold-start ms: min=${cold_min} p50=${cold_p50} max=${cold_max}"
 
 # ── 2. IDLE RSS + daemonless footprint (warm server) ─────────────────────────
@@ -141,7 +140,8 @@ JSON
 POD_ID="$(crictl runp "${POD_JSON}" 2>/dev/null || true)"
 sleep 0.3
 RSS_KB="$(ps -o rss= -p "${SERVER_PID}" | tr -d ' ')"
-THREADS="$(ps -o nlwp= -p "${SERVER_PID}" 2>/dev/null | tr -d ' ' || echo null)"
+THREADS="$(ps -o nlwp= -p "${SERVER_PID}" 2>/dev/null | tr -d ' ' || true)"
+case "${THREADS}" in (''|*[!0-9]*) THREADS=null;; esac   # numeric or JSON null
 # Daemonless proof: how many long-lived runtime processes exist. lightr-cri is
 # the single serve process — there is no separate daemon tree.
 PROC_COUNT="$( { pgrep -f "$(basename "${SERVER_BIN}") --socket ${SOCKET}" 2>/dev/null || true; } | wc -l | tr -d ' ')"
@@ -168,7 +168,7 @@ for _ in $(seq 1 "${RECOVERY_SAMPLES}"); do
     rederive_ok=false
   fi
 done
-IFS=',' read -r rec_min rec_p50 rec_max < <(stats < "${rec_file}")
+IFS=',' read -r rec_min rec_p50 rec_max < <(stats < "${rec_file}") || true
 note "crash-recovery ms: min=${rec_min} p50=${rec_p50} max=${rec_max}  state_rederived=${rederive_ok}"
 stop_server
 
