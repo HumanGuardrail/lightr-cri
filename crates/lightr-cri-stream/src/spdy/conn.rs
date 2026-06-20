@@ -649,9 +649,16 @@ pub async fn run_exec<S>(
     // aborting the whole registered set (a no-op if the read-loop already ended,
     // but the SAME drop runs if `run_exec`'s future is cancelled before reaching
     // here (session cap), which is what makes the cap actually tear down).
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), &mut read_loop).await;
-    read_loop.abort();
-    let _ = read_loop.await;
+    // If the grace elapses (Err) the read-loop is still running → abort + reap.
+    // If it returns Ok the read-loop already finished (client closed) — do NOT
+    // poll the JoinHandle again (awaiting a completed handle panics).
+    if tokio::time::timeout(std::time::Duration::from_secs(5), &mut read_loop)
+        .await
+        .is_err()
+    {
+        read_loop.abort();
+        let _ = read_loop.await;
+    }
 }
 
 /// Pump a session output file → DATA frames on `stream_id` until EOF.
