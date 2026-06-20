@@ -166,9 +166,9 @@
         <tr><td>Rede de pods (CNI)</td><td><b>real</b></td><td>bridge + port-mapping + netns reais, servidor em namespace no CI Linux</td><td class="st"><span class="dot g"></span>verde</td></tr>
         <tr><td>Pipeline completo (3 jobs)</td><td><b>success</b></td><td>verify-codegen · mac-compile · linux-conformance</td><td class="st"><span class="dot g"></span>verde</td></tr>
         <tr><td>Estado próprio do listener</td><td><b>0</b></td><td>Arquitetura stateless/crash-only — invariante de design, exercida nos testes</td><td class="st"><span class="dot g"></span>verde</td></tr>
-        <tr><td>Cold-start do runtime</td><td><b>p50 16 ms</b></td><td>spawn → 1ª RPC CRI respondida (n=10) — bench assinado, runner Linux <code>87216aa</code></td><td class="st"><span class="dot g"></span>verde</td></tr>
-        <tr><td>Footprint ocioso (daemonless)</td><td><b>~7 MB · 1 processo</b></td><td>VmRSS do processo único do shell (4 threads, sem árvore de daemon) — bench assinado</td><td class="st"><span class="dot g"></span>verde</td></tr>
-        <tr><td>Recuperação pós <code>kill -9</code></td><td><b>p50 15 ms</b></td><td>kill -9 → reinício no mesmo socket+estado → servindo, com estado re-derivado (n=5) — bench assinado</td><td class="st"><span class="dot g"></span>verde</td></tr>
+        <tr><td>Cold-start do runtime</td><td><b>p50 16 ms</b></td><td>spawn → 1ª RPC CRI respondida (n=10) — bench assinado, runner Linux</td><td class="st"><span class="dot g"></span>verde</td></tr>
+        <tr><td>Footprint ocioso (daemonless)</td><td><b>~7 MB</b> <span style="color:var(--dim)">vs ~47 MB containerd</span></td><td>VmRSS do processo único do shell (1 proc, 4 threads) vs. daemon containerd do mesmo host — <b>~6,7× mais leve</b> (referência rotulada; containerd faz mais no idle)</td><td class="st"><span class="dot g"></span>verde</td></tr>
+        <tr><td>Recuperação pós <code>kill -9</code></td><td><b>p50 17 ms</b></td><td>kill -9 → reinício no mesmo socket+estado → servindo, com estado re-derivado (n=5) — bench assinado</td><td class="st"><span class="dot g"></span>verde</td></tr>
       </tbody>
     </table>
     <p class="note" style="margin-top:14px">Cold-start, footprint e recuperação são medidos com o <b>backend fake (R1)</b>: refletem o <b>shell</b> daemonless/crash-only, não a carga real de containers — por isso assinados aqui e separados dos KPIs de CAS abaixo. Artefato: <code>ci/bench-results.json</code> (metodologia em <code>docs/bench/</code>).</p>
@@ -182,7 +182,7 @@
         <tr><td>Cold-start / footprint de container REAL</td><td><b>A/B vs containerd</b></td><td>Imagem OCI idêntica, mesmo runner; o shell já está assinado, falta a carga real (backend) + referência containerd</td><td class="st"><span class="dot t"></span>alvo</td></tr>
       </tbody>
     </table>
-    <p class="note" style="margin-top:16px">A honestidade desta separação <i>é</i> o ativo: investidor sério não compra número inflado — compra um time que sabe a diferença entre provado e prometido, e tem o método para fechar o gap.</p>
+    <p class="note" style="margin-top:16px">Estes alvos restantes estão <b>formalmente encaminhados</b> ao time do backend real, com spec e probe exatos por KPI (<code>docs/handoff/bench-cas-kpis-request.md</code>) — a bancada já reserva os campos; cada um vira "assinado" quando o backend entra. A honestidade desta separação <i>é</i> o ativo: investidor sério não compra número inflado — compra um time que sabe a diferença entre provado e prometido, e tem o método (e o roteamento) para fechar o gap.</p>
   </div>
 </section>
 
