@@ -186,6 +186,15 @@ pub fn derive_plugin_config(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    if std::env::var_os("LIGHTR_CNI_TRACE").is_some() {
+        eprintln!(
+            "[lightr-cri-net][TRACE] derive: type={:?} has_portmappings_cap={} port_mappings.len()={}",
+            plugin.get("type"),
+            has_portmappings_cap,
+            port_mappings.len()
+        );
+    }
+
     if has_portmappings_cap && !port_mappings.is_empty() {
         // CRI spec: host_port == 0 means "no host mapping" — omit those entries.
         // Passing host_port=0 to the portmap CNI plugin produces:
