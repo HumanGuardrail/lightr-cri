@@ -593,13 +593,16 @@ fn b5_hostport() {
     // mapping MUST live here on the pod config to reach CNI.
     let linux_ns =
         serde_json::json!({ "securityContext": { "namespaceOptions": { "network": 0 } } });
-    // hostPort mapping: containerPort=80 hostPort=12000 hostIp=127.0.0.1.
+    // hostPort mapping: container_port=80 host_port=12000 host_ip=127.0.0.1.
+    // crictl's pod-config loader uses the proto field names = SNAKE_CASE (same as
+    // log_directory/log_path). camelCase inner keys (hostPort/containerPort/hostIp)
+    // are silently IGNORED -> the entry arrives all-zero -> derive's host_port>0
+    // filter drops it -> no portmap runtimeConfig -> no DNAT. Use snake_case.
+    // protocol is the Protocol ENUM as its integer (0=TCP), not the string "TCP".
     let pod_port_mappings = serde_json::json!([{
-        "containerPort": 80,
-        "hostPort": 12000,
-        "hostIp": "127.0.0.1",
-        // crictl's pod-config loader wants the Protocol ENUM as its integer
-        // (0=TCP), not the string "TCP" (json: cannot unmarshal string into v1.Protocol).
+        "container_port": 80,
+        "host_port": 12000,
+        "host_ip": "127.0.0.1",
         "protocol": 0
     }]);
     let json = serde_json::json!({
