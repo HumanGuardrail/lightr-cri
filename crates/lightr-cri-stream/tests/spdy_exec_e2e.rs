@@ -8,8 +8,10 @@
 //!
 //! The flow mirrors client-go's `remotecommand` SPDY executor:
 //!   1. HTTP/1.1 `Upgrade: SPDY/3.1` POST → expect `101 Switching Protocols`.
-//!   2. Open the error + stdout streams via SYN_STREAM, header block compressed
-//!      with the SPDY dictionary (`streamType=error`, `streamType=stdout`).
+//!   2. Open the FULL non-tty exec stream set via SYN_STREAM, header block
+//!      compressed with the SPDY dictionary (`streamType=error`,
+//!      `streamType=stdout`, `streamType=stderr`) — the same set client-go's
+//!      `createStreams` opens, which the server's fast-exit barrier waits for.
 //!   3. Read the server's SYN_REPLY for each stream and DECOMPRESS its header
 //!      block — proving the server emits a *well-formed* zlib SYN_REPLY block.
 //!   4. Half-close so the server's read loop ends, then assert:
@@ -47,6 +49,7 @@ const CANON_DICT_SHA256: &str = "51d27341373f923f3cd88e1eb7162aeaa3723d7585ff239
 
 const STREAM_STDOUT: u32 = 1;
 const STREAM_ERROR: u32 = 3;
+const STREAM_STDERR: u32 = 5;
 
 /// A client header compressor: one continuous zlib stream, dictionary preset.
 struct ClientComp {
@@ -305,8 +308,13 @@ async fn run_exec_client(s: TcpStream, stdout_content_expected: usize) -> (Vec<u
     let mut decomp = ClientDecomp::new(CANON_DICT);
     let (mut rd, mut wr) = tokio::io::split(s);
 
-    // Open the error stream (id 3) then stdout (id 1), each with a streamType
-    // header compressed against the SPDY dictionary.
+    // Open the FULL non-tty exec stream set client-go's `createStreams` opens:
+    // error (id 3), stdout (id 1) AND stderr (id 5), each with a streamType
+    // header compressed against the SPDY dictionary. The server's fast-exit
+    // barrier waits for EVERY expected role (error+stdout+stderr for a non-tty,
+    // no-stdin exec) to land before it drains output and emits the terminal
+    // Status; opening only error+stdout leaves the barrier waiting its ~5s
+    // backstop and nothing is pumped in time.
     let err_block = comp.compress(&serialize_headers(&[("streamType", "error")]));
     wr.write_all(&syn_stream(STREAM_ERROR, &err_block))
         .await
@@ -315,6 +323,10 @@ async fn run_exec_client(s: TcpStream, stdout_content_expected: usize) -> (Vec<u
     wr.write_all(&syn_stream(STREAM_STDOUT, &out_block))
         .await
         .expect("write out syn");
+    let stderr_block = comp.compress(&serialize_headers(&[("streamType", "stderr")]));
+    wr.write_all(&syn_stream(STREAM_STDERR, &stderr_block))
+        .await
+        .expect("write stderr syn");
     wr.flush().await.expect("flush syns");
     // Half-close: signal EOF so the server's read loop ends, reaps the process
     // and delivers the v4 Status on the error stream (client-go closes its
@@ -376,6 +388,10 @@ async fn run_exec_client_no_halfclose(
     let mut comp = ClientComp::new(CANON_DICT);
     let (mut rd, mut wr) = tokio::io::split(s);
 
+    // Open the FULL non-tty exec stream set (error+stdout+stderr) so the
+    // server's fast-exit barrier resolves on CHILD-EXIT, not on transport
+    // close. This is the whole point of the test: with the full set opened the
+    // terminal Status arrives WITHOUT any client half-close.
     let err_block = comp.compress(&serialize_headers(&[("streamType", "error")]));
     wr.write_all(&syn_stream(STREAM_ERROR, &err_block))
         .await
@@ -384,6 +400,10 @@ async fn run_exec_client_no_halfclose(
     wr.write_all(&syn_stream(STREAM_STDOUT, &out_block))
         .await
         .expect("write out syn");
+    let stderr_block = comp.compress(&serialize_headers(&[("streamType", "stderr")]));
+    wr.write_all(&syn_stream(STREAM_STDERR, &stderr_block))
+        .await
+        .expect("write stderr syn");
     wr.flush().await.expect("flush syns");
     // NOTE: deliberately NO `wr.shutdown()` here. `wr` is kept alive below.
 
