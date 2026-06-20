@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lightr — Tese técnica, KPIs e plano de prova</title>
+<style>
+  :root{
+    --bg:#0a0c10; --card:#141923; --line:#222b39; --line2:#2b3647;
+    --ink:#eef2f8; --muted:#9aa7bd; --dim:#6c7a92;
+    --accent:#5eead4; --accent2:#7c9cff; --hot:#ff7a59; --good:#42d392; --warn:#ffcf5c;
+    --grad:linear-gradient(120deg,#5eead4 0%,#7c9cff 55%,#b388ff 100%);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    background:radial-gradient(1100px 560px at 85% -10%,rgba(124,156,255,.13),transparent 60%),
+               radial-gradient(800px 460px at -8% 6%,rgba(94,234,212,.09),transparent 55%),var(--bg);
+    color:var(--ink);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1000px;margin:0 auto;padding:0 28px}
+  .grad{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .eyebrow{font-size:12.5px;letter-spacing:.18em;text-transform:uppercase;color:var(--accent);font-weight:700}
+  code{font-family:"SF Mono",ui-monospace,Menlo,monospace;font-size:.9em;background:#0e131b;border:1px solid var(--line);border-radius:6px;padding:1px 6px;color:#bcd0ff}
+
+  header{padding:74px 0 40px;border-bottom:1px solid var(--line)}
+  .brand{display:flex;align-items:center;gap:13px;margin-bottom:30px}
+  .logo{width:38px;height:38px;border-radius:10px;background:var(--grad);display:grid;place-items:center;font-weight:800;color:#0a0c10;font-size:19px}
+  .brand b{font-size:17px}.brand span{color:var(--dim);font-size:13px}
+  h1{font-size:clamp(30px,4.6vw,48px);line-height:1.08;letter-spacing:-.02em;font-weight:800;margin:14px 0 16px}
+  .lede{font-size:18px;color:var(--muted);max-width:760px}
+  .toc{display:flex;flex-wrap:wrap;gap:8px;margin-top:26px}
+  .toc a{font-size:13px;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:6px 13px;text-decoration:none}
+  .toc a:hover{border-color:var(--line2);color:var(--ink)}
+
+  section{padding:54px 0;border-bottom:1px solid var(--line)}
+  h2{font-size:clamp(22px,3vw,30px);letter-spacing:-.01em;margin:6px 0 8px;font-weight:800}
+  h2 .n{color:var(--dim);font-weight:700;margin-right:10px}
+  .sub{color:var(--muted);max-width:780px;margin:14px 0 26px}
+  p{margin:0 0 14px} p.tx{color:var(--muted);max-width:800px}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:24px}
+  .card h3{font-size:16px;margin-bottom:6px}.card h3 .k{font-size:12px;color:var(--accent);letter-spacing:.08em;text-transform:uppercase;display:block;margin-bottom:6px}
+  .card p{color:var(--muted);font-size:14.5px;margin:0}
+  .note{color:var(--dim);font-size:13.5px}
+
+  /* comparison table */
+  table{width:100%;border-collapse:collapse;margin-top:6px;font-size:14.5px}
+  th,td{text-align:left;padding:14px 14px;border-top:1px solid var(--line);vertical-align:top}
+  thead th{border-top:none;color:var(--dim);font-size:12px;letter-spacing:.08em;text-transform:uppercase;font-weight:700}
+  tbody td:first-child{font-weight:600;color:var(--ink);width:24%}
+  .tag{display:inline-block;font-size:11px;font-weight:700;border-radius:999px;padding:3px 9px;white-space:nowrap}
+  .tag.win{color:var(--good);border:1px solid #1f4138;background:rgba(66,211,146,.08)}
+  .tag.par{color:var(--warn);border:1px solid #4a3f1f;background:rgba(255,207,92,.07)}
+  .bad{color:var(--hot)}.gd{color:var(--good)}
+
+  /* KPI tables */
+  .kpi th,.kpi td{padding:13px 14px}
+  .kpi .st{white-space:nowrap}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px;vertical-align:middle}
+  .dot.g{background:var(--good);box-shadow:0 0 9px var(--good)}
+  .dot.t{background:var(--accent2);box-shadow:0 0 9px var(--accent2)}
+  .kpi tbody td:first-child{width:30%}
+  .banner{display:flex;gap:12px;align-items:flex-start;background:linear-gradient(180deg,#0f1620,#0d1117);border:1px solid var(--line2);border-radius:14px;padding:16px 18px;margin:0 0 22px;color:var(--muted);font-size:14px}
+  .banner .b{font-size:18px}
+  .banner.proven{border-color:#1f4138}.banner.target{border-color:#2a3556}
+
+  ol.steps{counter-reset:s;list-style:none;margin-top:8px}
+  ol.steps li{position:relative;padding:16px 0 16px 52px;border-top:1px solid var(--line);color:var(--muted)}
+  ol.steps li:first-child{border-top:none}
+  ol.steps li::before{counter-increment:s;content:counter(s);position:absolute;left:0;top:14px;width:32px;height:32px;border-radius:9px;background:var(--card);border:1px solid var(--line2);color:var(--accent);font-weight:800;display:grid;place-items:center}
+  ol.steps b{color:var(--ink)}
+
+  .pull{font-size:18px;color:var(--ink);border-left:3px solid;border-image:var(--grad) 1;padding:4px 0 4px 18px;margin:18px 0;max-width:760px}
+  footer{padding:46px 0 70px;text-align:center;color:var(--dim)}
+  @media(max-width:780px){.two{grid-template-columns:1fr}tbody td:first-child{width:auto}}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <div class="brand"><div class="logo">L</div><div><b>HuGR · Lightr</b><br><span>tese técnica · KPIs · plano de prova</span></div></div>
+    <div class="eyebrow">Documento técnico para investidor</div>
+    <h1>O que é o <span class="grad">Lightr</span>, por que é melhor,<br>e como vamos <span class="grad">provar</span>.</h1>
+    <p class="lede">Este documento separa, com honestidade de engenharia, o que <b>já está assinado por CI</b> do que ainda é <b>alvo</b> —
+    e descreve exatamente o método pelo qual cada alvo vira número assinado. Nenhuma afirmação de desempenho aqui é "achismo": ou já passou no CI, ou está marcada como meta com seu plano de prova.</p>
+    <div class="toc">
+      <a href="#oque">1 · O que é Lightr</a>
+      <a href="#proj">2 · O projeto (lightr-cri)</a>
+      <a href="#melhor">3 · O que é melhor / o que muda</a>
+      <a href="#kpi">4 · KPIs: assinados &amp; alvos</a>
+      <a href="#prova">5 · Como provamos</a>
+    </div>
+  </div>
+</header>
+
+<!-- 1 -->
+<section id="oque">
+  <div class="wrap">
+    <div class="eyebrow">Definição</div>
+    <h2><span class="n">01</span>O que é Lightr</h2>
+    <p class="sub">Lightr é um <b>runtime de containers nativo em conteúdo (CAS), sem daemon e crash-only</b>.
+    É a peça que pega uma imagem e a coloca para rodar — o mesmo papel do <code>containerd</code>+<code>runc</code> por baixo do Docker — mas com uma arquitetura fundamentalmente diferente.</p>
+    <div class="two">
+      <div class="card"><h3><span class="k">CAS-native</span>Conteúdo endereçado por hash</h3><p>Cada blob (camada, arquivo, artefato de build) existe uma única vez, identificado pelo seu hash. Deduplicação não é uma otimização — é a estrutura de dados. O que já está no nó nunca é baixado, extraído ou armazenado de novo.</p></div>
+      <div class="card"><h3><span class="k">Daemonless</span>O listener não é dono de nada</h3><p>Não há um processo central de longa vida segurando o estado. O kernel e o disco são a fonte da verdade; o runtime é apenas uma <i>visão</i> sobre eles. Sem daemon, sem RAM presa só para "existir".</p></div>
+      <div class="card"><h3><span class="k">Crash-only</span>Recuperar = reabrir a visão</h3><p>Projetado para morrer a qualquer instante. <code>kill -9</code> no meio de uma operação e nada se perde, nada precisa reconciliar — porque nunca houve um espelho em memória para desincronizar.</p></div>
+      <div class="card"><h3><span class="k">Memoizável</span>O mesmo trabalho nunca se repete</h3><p>Como tudo é endereçado por conteúdo, operações (build, layer, exec) são memoizáveis pelo hash da entrada. Refazer trabalho idêntico é, por construção, um cache-hit.</p></div>
+    </div>
+    <p class="note" style="margin-top:18px">Origem: Lightr é "o Docker do HuGR" — o runtime que herda as semânticas de CAS do CoreLink. O produto local (R0–R4) já está entregue.</p>
+  </div>
+</section>
+
+<!-- 2 -->
+<section id="proj">
+  <div class="wrap">
+    <div class="eyebrow">Meu projeto neste ciclo</div>
+    <h2><span class="n">02</span>lightr-cri — a porta para o Kubernetes</h2>
+    <p class="sub">Lightr roda containers. Mas o mundo orquestra containers com <b>Kubernetes</b>. Para o Kubernetes usar o Lightr,
+    ele precisa falar o protocolo padrão que o cluster espera: o <b>CRI (Container Runtime Interface)</b>. <b>lightr-cri</b> é exatamente essa camada.</p>
+    <p class="tx">É a casca voltada ao <code>kubelet</code>: recebe as chamadas gRPC do Kubernetes (criar pod, rodar container, exec, logs, rede) e as traduz para o Lightr — <b>sem manter estado próprio</b>. Fiel ao princípio: mate o processo no meio de uma operação e nada se perde. É o que torna o Lightr <i>plugável</i> em qualquer cluster Kubernetes, em vez de ser só um runtime local.</p>
+    <div class="card" style="font-family:'SF Mono',ui-monospace,Menlo,monospace;background:linear-gradient(180deg,#0f141c,#0c1016);text-align:center;padding:28px">
+      <span style="color:#bcd0ff">kubelet</span> &nbsp;<span style="color:var(--accent2)">→</span>&nbsp;
+      <span style="color:var(--muted)">CRI gRPC</span> &nbsp;<span style="color:var(--accent2)">→</span>&nbsp;
+      <span style="color:#cfe0ff">lightr-cri <span style="color:var(--dim);font-size:12px">(stateless)</span></span> &nbsp;<span style="color:var(--accent2)">→</span>&nbsp;
+      <span style="color:#8ff0db">Lightr / CoreLink CAS</span>
+    </div>
+    <p class="note" style="margin-top:16px">Construído em repo próprio, contra um <b>contrato de seam congelado</b> — integra ao HuGR no fim por troca de contrato, nunca copy-paste. Conformidade é a suíte de aceitação (red→green).</p>
+  </div>
+</section>
+
+<!-- 3 -->
+<section id="melhor">
+  <div class="wrap">
+    <div class="eyebrow">A tese</div>
+    <h2><span class="n">03</span>O que é melhor — e o que muda</h2>
+    <p class="sub">A barra que perseguimos é explícita e honesta: <b>dominância estrutural</b> onde a arquitetura nos dá vantagem por construção
+    (pull, footprint, restart, memoização) e <b>paridade no piso de kernel</b> — onde todo runtime, no fim, faz a mesma syscall.</p>
+    <table>
+      <thead><tr><th>Dimensão</th><th>Stack atual (Docker/containerd)</th><th>Lightr</th><th>Veredito-alvo</th></tr></thead>
+      <tbody>
+        <tr><td>Pull / distribuição</td><td class="bad">Camadas redundantes; baixa, descompacta, armazena de novo</td><td class="gd">CAS: conteúdo já presente nunca re-trafega nem re-extrai</td><td><span class="tag win">dominância</span></td></tr>
+        <tr><td>Footprint ocioso</td><td class="bad">Daemon de longa vida consome RAM/CPU só para existir</td><td class="gd">Sem daemon: ~zero estado próprio residente</td><td><span class="tag win">dominância</span></td></tr>
+        <tr><td>Restart / recuperação</td><td class="bad">Reconciliação de estado espelhado após queda</td><td class="gd">Crash-only: recuperar = reabrir a visão do disco</td><td><span class="tag win">dominância</span></td></tr>
+        <tr><td>Trabalho repetido (build/layer)</td><td class="bad">Cache frágil, por caminho/tag</td><td class="gd">Memoização por hash de conteúdo</td><td><span class="tag win">dominância</span></td></tr>
+        <tr><td>Execução do processo (piso de kernel)</td><td>Mesmas syscalls (clone/exec/cgroups/netns)</td><td>Mesmas syscalls</td><td><span class="tag par">paridade declarada</span></td></tr>
+        <tr><td>Compatibilidade Kubernetes</td><td>CRI conforme (critest)</td><td class="gd">CRI conforme — critest verde</td><td><span class="tag win">paridade comprovada</span></td></tr>
+      </tbody>
+    </table>
+    <p class="pull">O que muda para o cliente: nós mais densos (sem o imposto do daemon), cold starts e re-pulls que somem para conteúdo já visto, e recuperação sem o drama da reconciliação — <b>sem trocar de ecossistema</b>, porque continua sendo Kubernetes.</p>
+  </div>
+</section>
+
+<!-- 4 -->
+<section id="kpi">
+  <div class="wrap">
+    <div class="eyebrow">Indicadores</div>
+    <h2><span class="n">04</span>KPIs — o que já está assinado, e os alvos</h2>
+
+    <div class="banner proven"><span class="b">✅</span><div><b style="color:var(--good)">Assinados por CI</b> — não são metas; são fatos verificáveis no pipeline. Reprodutíveis em runner Linux a cada push.</div></div>
+    <table class="kpi">
+      <thead><tr><th>KPI</th><th>Valor</th><th>Como é verificado</th><th class="st">Status</th></tr></thead>
+      <tbody>
+        <tr><td>Conformidade CRI (critest)</td><td><b>33/33</b> specs</td><td>Suíte oficial Kubernetes <code>critest v1.33</code>, gate fail-closed (GREENLIST)</td><td class="st"><span class="dot g"></span>verde</td></tr>
+        <tr><td>Streaming exec/attach/port-forward</td><td><b>ponta-a-ponta</b></td><td>Protocolo SPDY/WebSocket do kubelet, testes e2e + critest</td><td class="st"><span class="dot g"></span>verde</td></tr>
+        <tr><td>Rede de pods (CNI)</td><td><b>real</b></td><td>bridge + port-mapping + netns reais, servidor em namespace no CI Linux</td><td class="st"><span class="dot g"></span>verde</td></tr>
+        <tr><td>Pipeline completo (3 jobs)</td><td><b>success</b></td><td>verify-codegen · mac-compile · linux-conformance — commit <code>7de862d</code></td><td class="st"><span class="dot g"></span>verde</td></tr>
+        <tr><td>Estado próprio do listener</td><td><b>0</b></td><td>Arquitetura stateless/crash-only — invariante de design, exercida nos testes</td><td class="st"><span class="dot g"></span>verde</td></tr>
+      </tbody>
+    </table>
+
+    <div class="banner target" style="margin-top:30px"><span class="b">🎯</span><div><b style="color:var(--accent2)">Alvos (ainda não assinados)</b> — metas estruturais com a base que as torna plausíveis. <b>Disciplina:</b> nenhum número vira "claim" antes de um run A/B assiná-lo (princípio fail-closed da casa).</div></div>
+    <table class="kpi">
+      <thead><tr><th>KPI-alvo</th><th>Meta</th><th>Por que é plausível (base estrutural)</th><th class="st">Status</th></tr></thead>
+      <tbody>
+        <tr><td>Re-pull de camada já presente</td><td><b>→ 0 bytes</b></td><td>CAS por hash: conteúdo existente não re-trafega nem re-extrai</td><td class="st"><span class="dot t"></span>alvo</td></tr>
+        <tr><td>Footprint ocioso / nó</td><td><b>≈ 0</b> daemon RSS</td><td>Sem processo de longa vida; vs. RSS residente do containerd</td><td class="st"><span class="dot t"></span>alvo</td></tr>
+        <tr><td>Cold start (conteúdo em cache)</td><td><b>paridade com runc</b></td><td>Lightr não adiciona etapa de descompactação antes do exec</td><td class="st"><span class="dot t"></span>alvo</td></tr>
+        <tr><td>Recuperação após <code>kill -9</code></td><td><b>sem passo de reconciliação</b></td><td>Crash-only: nada para sincronizar; restaurar = reabrir a visão</td><td class="st"><span class="dot t"></span>alvo</td></tr>
+        <tr><td>Disco p/ N imagens semelhantes</td><td><b>dedup ∝ conteúdo compartilhado</b></td><td>Armazenamento único por blob, vs. camadas por-imagem</td><td class="st"><span class="dot t"></span>alvo</td></tr>
+      </tbody>
+    </table>
+    <p class="note" style="margin-top:16px">A honestidade desta separação <i>é</i> o ativo: investidor sério não compra número inflado — compra um time que sabe a diferença entre provado e prometido, e tem o método para fechar o gap.</p>
+  </div>
+</section>
+
+<!-- 5 -->
+<section id="prova">
+  <div class="wrap">
+    <div class="eyebrow">Plano de prova</div>
+    <h2><span class="n">05</span>Como vamos provar que é melhor</h2>
+    <p class="sub">O método é um <b>head-to-head reprodutível</b> contra <code>containerd</code>/Docker, no mesmo host, com as mesmas imagens — e a correção vem antes da velocidade.</p>
+    <ol class="steps">
+      <li><b>Piso de correção primeiro.</b> Antes de qualquer claim de performance, o Lightr passa na <i>mesma</i> suíte oficial que valida os concorrentes (critest). <span class="gd">Já feito: 33/33 verde.</span> Sem isso, "mais rápido" é irrelevante.</li>
+      <li><b>Bancada A/B idêntica.</b> Mesmo runner Linux, mesmas imagens OCI, mesmo kernel/cgroups. Lightr vs. containerd lado a lado — única variável é o runtime.</li>
+      <li><b>Probes deterministas.</b> Cada KPI estrutural medido por uma sonda reprodutível: bytes transferidos no pull, RSS residente ocioso, tempo de cold start (cache frio vs. quente), tempo de recuperação pós-<code>kill -9</code>, bytes em disco para N imagens.</li>
+      <li><b>Assinatura por CI (fail-closed).</b> O número só é publicado depois que um run o assina — registrado com commit, host e versões. Sem run, sem claim. É o mesmo princípio que já governa a conformidade.</li>
+      <li><b>Regressão travada (GREENLIST).</b> Cada vitória vira gate: o que ficou verde não pode regredir sem o pipeline acusar. KPIs não são fotos — são contratos contínuos.</li>
+    </ol>
+    <p class="pull">Em uma frase: <b>provamos como provamos a conformidade</b> — com uma suíte que ou está verde, ou falha alto. A diferença é que agora a métrica é desempenho estrutural, não só correção.</p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="grad" style="font-size:20px;font-weight:800;margin-bottom:6px">HuGR · Lightr</div>
+    <p>Conformidade comprovada hoje. Vantagem estrutural por construção. Método de prova definido.</p>
+    <p class="note" style="margin-top:8px">CI verde · commit 7de862d · critest 33/33 · 3/3 jobs success</p>
+  </div>
+</footer>
+
+</body>
+</html>

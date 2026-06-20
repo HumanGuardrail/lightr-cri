@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HuGR Lightr — o runtime de containers da próxima década</title>
+<style>
+  :root{
+    --bg:#0a0c10; --bg2:#0f131a; --card:#141923; --line:#222b39;
+    --ink:#eef2f8; --muted:#9aa7bd; --dim:#6c7a92;
+    --accent:#5eead4; --accent2:#7c9cff; --hot:#ff7a59; --good:#42d392;
+    --grad:linear-gradient(120deg,#5eead4 0%,#7c9cff 55%,#b388ff 100%);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    background:radial-gradient(1200px 600px at 80% -10%,rgba(124,156,255,.14),transparent 60%),
+               radial-gradient(900px 500px at -10% 10%,rgba(94,234,212,.10),transparent 55%),
+               var(--bg);
+    color:var(--ink);
+    font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1080px;margin:0 auto;padding:0 28px}
+  .eyebrow{font-size:13px;letter-spacing:.18em;text-transform:uppercase;color:var(--accent);font-weight:600}
+  .grad{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+
+  /* HERO */
+  header{padding:90px 0 56px;border-bottom:1px solid var(--line)}
+  .brand{display:flex;align-items:center;gap:14px;margin-bottom:38px}
+  .logo{width:40px;height:40px;border-radius:11px;background:var(--grad);
+    display:grid;place-items:center;font-weight:800;color:#0a0c10;font-size:20px;box-shadow:0 8px 30px rgba(124,156,255,.35)}
+  .brand b{font-size:18px;letter-spacing:.02em}
+  .brand span{color:var(--dim);font-size:14px}
+  h1{font-size:clamp(34px,5.2vw,60px);line-height:1.05;letter-spacing:-.02em;font-weight:800;margin:18px 0 22px}
+  .lede{font-size:clamp(17px,2vw,21px);color:var(--muted);max-width:760px}
+  .pills{display:flex;flex-wrap:wrap;gap:10px;margin-top:34px}
+  .pill{border:1px solid var(--line);background:var(--card);border-radius:999px;padding:8px 16px;font-size:14px;color:var(--ink)}
+  .pill b{color:var(--accent)}
+
+  section{padding:64px 0;border-bottom:1px solid var(--line)}
+  h2{font-size:clamp(24px,3.2vw,34px);letter-spacing:-.01em;margin:14px 0 26px;font-weight:800}
+  .sub{color:var(--muted);max-width:740px;margin-bottom:30px;font-size:17px}
+
+  /* PROBLEM vs SOLUTION */
+  .vs{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  .col{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:26px}
+  .col.bad{border-color:#3a2630}
+  .col.good{border-color:#1f4138}
+  .col h3{font-size:15px;text-transform:uppercase;letter-spacing:.1em;margin-bottom:18px}
+  .col.bad h3{color:var(--hot)} .col.good h3{color:var(--good)}
+  .col ul{list-style:none} .col li{padding:10px 0 10px 30px;position:relative;color:var(--muted);border-top:1px solid var(--line)}
+  .col li:first-child{border-top:none}
+  .col li b{color:var(--ink);font-weight:600}
+  .col.bad li::before{content:"✕";position:absolute;left:0;color:var(--hot);font-weight:700}
+  .col.good li::before{content:"✓";position:absolute;left:0;color:var(--good);font-weight:700}
+
+  /* PILLARS */
+  .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
+  .feat{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:24px;transition:transform .2s,border-color .2s}
+  .feat:hover{transform:translateY(-3px);border-color:#34425a}
+  .feat .ic{font-size:24px;margin-bottom:14px}
+  .feat h4{font-size:17px;margin-bottom:8px}
+  .feat p{color:var(--muted);font-size:14.5px}
+
+  /* PRODUCT / ARCH */
+  .arch{background:linear-gradient(180deg,#0f141c,#0c1016);border:1px solid var(--line);border-radius:20px;padding:34px;font-family:"SF Mono",ui-monospace,Menlo,monospace}
+  .arch .row{display:flex;align-items:center;justify-content:center;gap:14px;flex-wrap:wrap;color:var(--muted);font-size:14px}
+  .node{background:#121826;border:1px solid var(--line);border-radius:12px;padding:12px 18px;color:var(--ink)}
+  .node.k{border-color:#33405a;color:#bcd0ff}
+  .node.core{border-color:#234b42;color:#8ff0db}
+  .arrow{color:var(--accent2);font-size:20px}
+  .archcap{text-align:center;color:var(--dim);font-size:13px;margin-top:20px}
+
+  /* STATUS */
+  .status{display:grid;grid-template-columns:1.1fr .9fr;gap:18px;align-items:start}
+  .ledger{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:8px 26px}
+  .ledger .li{display:flex;align-items:center;gap:14px;padding:16px 0;border-top:1px solid var(--line)}
+  .ledger .li:first-child{border-top:none}
+  .dot{width:9px;height:9px;border-radius:50%;flex:0 0 9px}
+  .dot.g{background:var(--good);box-shadow:0 0 12px var(--good)}
+  .dot.p{background:var(--accent2);box-shadow:0 0 12px var(--accent2)}
+  .ledger .t{font-weight:600}.ledger .d{color:var(--dim);font-size:13px}
+  .ledger .li .meta{margin-left:auto;font-size:12px;color:var(--good);border:1px solid #1f4138;border-radius:999px;padding:3px 10px}
+  .ledger .li .meta.run{color:var(--accent2);border-color:#2a3556}
+  .metric{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:26px;text-align:center}
+  .metric .big{font-size:46px;font-weight:800;letter-spacing:-.02em}
+  .metric .lbl{color:var(--muted);font-size:14px;margin-top:6px}
+  .metric+.metric{margin-top:18px}
+
+  /* ROADMAP */
+  .road{display:grid;grid-template-columns:repeat(5,1fr);gap:0;margin-top:10px}
+  .stage{position:relative;padding:22px 14px;text-align:center}
+  .stage::before{content:"";position:absolute;top:30px;left:0;right:0;height:2px;background:var(--line)}
+  .stage .b{position:relative;width:14px;height:14px;border-radius:50%;background:var(--bg);border:2px solid var(--dim);margin:0 auto 16px;z-index:1}
+  .stage.done .b{background:var(--good);border-color:var(--good);box-shadow:0 0 12px var(--good)}
+  .stage.now .b{background:var(--accent2);border-color:var(--accent2);box-shadow:0 0 14px var(--accent2)}
+  .stage h5{font-size:14px;margin-bottom:4px}.stage p{font-size:12px;color:var(--dim)}
+  .stage.done h5,.stage.now h5{color:var(--ink)}
+
+  footer{padding:54px 0 80px;text-align:center;color:var(--dim)}
+  .cta{display:inline-block;margin-top:8px;background:var(--grad);color:#0a0c10;font-weight:700;padding:14px 28px;border-radius:12px;text-decoration:none;box-shadow:0 10px 40px rgba(124,156,255,.3)}
+  @media(max-width:820px){.vs,.grid3,.status{grid-template-columns:1fr}.road{grid-template-columns:1fr;gap:8px}.stage::before{display:none}}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <div class="brand">
+      <div class="logo">L</div>
+      <div><b>HuGR · Lightr</b><br><span>runtime layer</span></div>
+    </div>
+    <div class="eyebrow">O motor de containers, reescrito do zero</div>
+    <h1>O <span class="grad">Docker</span> foi feito para 2013.<br>O <span class="grad">Lightr</span> é feito para a era do Kubernetes&nbsp;e&nbsp;da&nbsp;IA.</h1>
+    <p class="lede">Um runtime de containers <b>nativo em conteúdo (CAS)</b>, <b>sem daemon</b> e <b>crash-only</b> —
+    estruturalmente mais leve e mais rápido que o stack atual (Docker → containerd → runc),
+    e <b>nativo do Kubernetes</b> via CRI. Sem estado para corromper. Sem reconciliação para travar.</p>
+    <div class="pills">
+      <span class="pill">⚡ Cold start <b>quase instantâneo</b></span>
+      <span class="pill">🪶 Footprint <b>mínimo</b></span>
+      <span class="pill">☸️ Conformidade <b>Kubernetes CRI</b></span>
+      <span class="pill">🛡️ <b>kill -9</b> e nada se perde</span>
+    </div>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <div class="eyebrow">O problema</div>
+    <h2>O stack de containers de hoje carrega peso morto.</h2>
+    <p class="sub">Todo cluster Kubernetes hoje roda sobre um daemon pesado e cheio de estado. Ele duplica armazenamento,
+    demora a subir, ocupa muita memória, e quando algo desincroniza, entra num loop de reconciliação. É a camada
+    mais crítica da infraestrutura — e a mais frágil.</p>
+    <div class="vs">
+      <div class="col bad">
+        <h3>Docker / containerd hoje</h3>
+        <ul>
+          <li><b>Daemon stateful</b> — um processo dono de tudo; se ele cai, o nó sofre.</li>
+          <li><b>Armazenamento redundante</b> — camadas repetidas, pull lento, disco desperdiçado.</li>
+          <li><b>Cold start lento</b> — descompactar e montar antes de rodar.</li>
+          <li><b>Reconciliação</b> — estado espelhado que desincroniza e precisa se "curar".</li>
+          <li><b>Footprint alto</b> — memória e CPU presos só para manter o daemon vivo.</li>
+        </ul>
+      </div>
+      <div class="col good">
+        <h3>Lightr</h3>
+        <ul>
+          <li><b>Sem daemon</b> — o listener não é dono de nada; o kernel e o disco são a verdade.</li>
+          <li><b>CAS-native</b> — conteúdo endereçado por hash: deduplicado por construção, pull mínimo.</li>
+          <li><b>Cold start estrutural</b> — sem cópia: o conteúdo já está pronto no CAS.</li>
+          <li><b>Crash-only</b> — <code>kill -9</code> a qualquer momento; nada se perde, nada reconcilia.</li>
+          <li><b>Footprint mínimo</b> — zero estado próprio para manter de pé.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="eyebrow">Por que é melhor — e não é marketing</div>
+    <h2>Quatro vantagens <span class="grad">estruturais</span>, não ajustes.</h2>
+    <p class="sub">Estas vantagens vêm do <i>design</i>, não de otimização. É a diferença entre "mais rápido"
+    e "rápido por construção".</p>
+    <div class="grid3">
+      <div class="feat"><div class="ic">📥</div><h4>Pull</h4><p>Conteúdo endereçado por hash (CAS): cada blob existe uma vez. Imagens compartilham camadas de verdade — o que já está no nó nunca é baixado de novo.</p></div>
+      <div class="feat"><div class="ic">🪶</div><h4>Footprint</h4><p>Sem daemon, sem estado espelhado. O runtime é uma visão sobre o disco e o kernel — não uma cópia que precisa de RAM para existir.</p></div>
+      <div class="feat"><div class="ic">♻️</div><h4>Restart</h4><p>Crash-only por princípio. Reiniciar é instantâneo porque não há nada para reconciliar — a fonte da verdade nunca esteve em memória.</p></div>
+      <div class="feat"><div class="ic">🧠</div><h4>Memoização</h4><p>Operações são endereçadas por conteúdo: o mesmo trabalho nunca é refeito. Build, layer, exec — tudo memoizável pelo hash.</p></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="eyebrow">O produto</div>
+    <h2>Lightr corre por baixo. <span class="grad">lightr-cri</span> conecta no Kubernetes.</h2>
+    <p class="sub">O Kubernetes fala com o runtime através de um contrato padrão: o <b>CRI</b> (Container Runtime Interface).
+    Construímos o <b>lightr-cri</b> — uma camada stateless que deixa o <code>kubelet</code> dirigir o Lightr diretamente.
+    Plugue no cluster e ele simplesmente funciona, como conformidade comprovada.</p>
+    <div class="arch">
+      <div class="row">
+        <span class="node k">kubelet</span>
+        <span class="arrow">→</span>
+        <span class="node">CRI gRPC (unix socket)</span>
+        <span class="arrow">→</span>
+        <span class="node" style="border-color:#3a4a66;color:#cfe0ff">lightr-cri<br><span style="font-size:11px;color:var(--dim)">shell stateless</span></span>
+        <span class="arrow">→</span>
+        <span class="node core">CoreLink CAS<br><span style="font-size:11px;color:var(--dim)">via Lightr</span></span>
+      </div>
+      <div class="archcap">O listener não é dono de nada. Mate-o no meio de uma operação — nada se perde, nada reconcilia, porque nunca houve um espelho.</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="eyebrow">Onde estamos — hoje</div>
+    <h2>Não é slide. É <span class="grad">verde no CI</span>.</h2>
+    <p class="sub">O produto local (R0–R4) está entregue. A camada Kubernetes (R1) acabou de conquistar
+    a suíte de conformidade oficial do Kubernetes (<b>critest</b>) — o mesmo teste que valida Docker e containerd.</p>
+    <div class="status">
+      <div class="ledger">
+        <div class="li"><span class="dot g"></span><div><div class="t">Runtime Lightr (R0–R4)</div><div class="d">Produto local CAS-native, daemonless, crash-only</div></div><span class="meta">entregue</span></div>
+        <div class="li"><span class="dot g"></span><div><div class="t">Conformidade CRI — critest</div><div class="d">Suíte oficial do Kubernetes, mesma que valida Docker/containerd</div></div><span class="meta">33/33 verde</span></div>
+        <div class="li"><span class="dot g"></span><div><div class="t">Streaming: exec / attach / port-forward</div><div class="d">Protocolo SPDY/WebSocket do kubelet, ponta a ponta</div></div><span class="meta">verde</span></div>
+        <div class="li"><span class="dot g"></span><div><div class="t">Rede de pods (CNI)</div><div class="d">bridge + port-mapping + netns reais em Linux CI</div></div><span class="meta">verde</span></div>
+        <div class="li"><span class="dot p"></span><div><div class="t">Integração no HuGR</div><div class="d">Swap de contrato no workspace principal — sem copy-paste</div></div><span class="meta run">próximo</span></div>
+      </div>
+      <div>
+        <div class="metric"><div class="big grad">33/33</div><div class="lbl">specs critest passando<br>(conformidade Kubernetes)</div></div>
+        <div class="metric"><div class="big grad">0</div><div class="lbl">estado próprio para corromper<br>(arquitetura crash-only)</div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="eyebrow">Roadmap</div>
+    <h2>Do runtime local ao Kubernetes em produção.</h2>
+    <div class="road">
+      <div class="stage done"><div class="b"></div><h5>R0 — Núcleo</h5><p>CAS + execução local</p></div>
+      <div class="stage done"><div class="b"></div><h5>R1 — CRI</h5><p>Conformidade Kubernetes</p></div>
+      <div class="stage now"><div class="b"></div><h5>R2 — Integração</h5><p>Plugue no HuGR</p></div>
+      <div class="stage"><div class="b"></div><h5>R3 — Fabric</h5><p>Runners HuGR em escala</p></div>
+      <div class="stage"><div class="b"></div><h5>R4 — Plataforma</h5><p>k8s self-managed como porta</p></div>
+    </div>
+  </div>
+</section>
+
+<section style="border:none">
+  <div class="wrap">
+    <div class="eyebrow">Mercado</div>
+    <h2>A camada que <span class="grad">todo container do mundo</span> atravessa.</h2>
+    <p class="sub">O runtime é a base de toda a infraestrutura cloud-native. Quem controla essa camada com
+    vantagem estrutural — não incremental — redefine o custo e a velocidade de rodar software.
+    Nosso foco inicial (ICP): a fabric de <b>Runners do HuGR</b> primeiro; Kubernetes self-managed
+    como porta de entrada para o CoreLink em segundo. Sem cruzada por managed-k8s — entrada por onde o valor é nosso.</p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="grad" style="font-size:22px;font-weight:800;margin-bottom:6px">HuGR · Lightr</div>
+    <p>O runtime de containers nativo em conteúdo — leve por construção, conforme com Kubernetes, sem estado para perder.</p>
+    <a class="cta" href="#">Construído. Verde. Pronto para integrar.</a>
+  </div>
+</footer>
+
+</body>
+</html>
