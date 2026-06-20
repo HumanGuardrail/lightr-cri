@@ -50,6 +50,8 @@ cleanup() {
   rm -rf "${TMP_DIR}"
 }
 trap cleanup EXIT
+# Diagnostic: pinpoint the exact failing command/line under set -e (temporary).
+trap 'rc=$?; echo "bench: ERR rc=${rc} at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
 
 die()  { echo "bench: FATAL: $*" >&2; exit 1; }
 note() { echo "bench: $*" >&2; }
@@ -115,6 +117,7 @@ stats() {
 }
 
 # ── 1. COLD-START: spawn → first answered RPC ────────────────────────────────
+set -x  # TEMPORARY diagnostic trace — remove once the bench step is green
 note "cold-start × ${COLD_SAMPLES} …"
 cold_file="${TMP_DIR}/cold.txt"; : > "${cold_file}"
 for _ in $(seq 1 "${COLD_SAMPLES}"); do
