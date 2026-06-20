@@ -104,3 +104,15 @@ image status get image fields should not have Uid  # reason → R2
 listImage should get exactly 3 image in the result list  # reason → R2
 listImage should get exactly 3 repoTags  # reason → R2
 public image should timeout if requested  # reason → R2
+
+# Networking with a real workload (port-mapping + portforward) — RUNTIME-TIER.
+# critest's networking container uses the webserver IMAGE's ENTRYPOINT (no
+# Command/Args override; pkg/validate/networking.go createWebServerContainer),
+# i.e. the HTTP server is a real image binary. The fake has no image layer and
+# runs HOST binaries, so there is no server to listen on the CNI IP -> the test
+# curl gets connection refused. Not fake-conquerable; the lightr backend
+# conquers it (materialize image from CAS + run its entrypoint inside the sandbox
+# netns). CNI portmap DNAT + the dial-in-netns wiring are already correct.
+# Owner-directed conquest attempted; proven runtime-tier 2026-06-20.
+port mapping  # reason → R2 (runtime-tier: real image HTTP server)
+portforward  # reason → R2 (runtime-tier: real image HTTP server)
