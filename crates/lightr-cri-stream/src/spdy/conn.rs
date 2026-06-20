@@ -303,6 +303,17 @@ pub async fn run_exec<S>(
                                     l.push(h.abort_handle());
                                 }
                                 output_tasks.lock().await.push(h);
+                                // The pump is now registered in `output_tasks`.
+                                // Re-notify so the completion path's drain gate
+                                // (which waits for the pumps, not just the role
+                                // ids) observes it. Without this second notify a
+                                // reaper-first completion for a fast TTY exec
+                                // (`echo` via the pty master) can snapshot an
+                                // EMPTY `output_tasks` between the by_role insert
+                                // and this push, draining nothing and tearing the
+                                // session down before the pty-master "hello" is
+                                // forwarded → client times out (the tty=true flake).
+                                role_added.notify_waiters();
                             }
                         } else if role == ch::STDERR {
                             if let Some(file) = stderr_raw.take() {
@@ -315,6 +326,7 @@ pub async fn run_exec<S>(
                                     l.push(h.abort_handle());
                                 }
                                 output_tasks.lock().await.push(h);
+                                role_added.notify_waiters();
                             }
                         }
                     }
@@ -472,6 +484,42 @@ pub async fn run_exec<S>(
         tokio::select! {
             _ = tokio::time::timeout(std::time::Duration::from_secs(5), barrier) => {}
             _ = &mut detached => { detached_fired = true; }
+        }
+
+        // 0b. Drain-readiness gate (TTY-exec output-delivery fix). The barrier
+        //     above only proves the client's stream IDS have landed in
+        //     `by_role`; it does NOT prove the read-loop has finished SPAWNING
+        //     and REGISTERING the output pumps in `output_tasks` (those are
+        //     pushed AFTER the by_role insert). For a fast TTY exec the reaper
+        //     can already be resolved here, so the completion select's `drain`
+        //     would `mem::take` an EMPTY `output_tasks`, await nothing, and tear
+        //     the session down BEFORE the pty-master pump forwards the child's
+        //     buffered output → client-go "Timeout occurred". So wait until one
+        //     output pump per expected output role is registered. The pty slave
+        //     closes on child exit → master EOFs → the pump (now guaranteed
+        //     present) is awaited to completion by `drain`, delivering every
+        //     byte before the Status. Bounded by the same backstop and raced
+        //     against detach so a client that bails early still tears down.
+        //     Skip when already detached (nothing left to drain for the client).
+        if !detached_fired {
+            let expected_pumps = {
+                // stdout always; stderr only when NOT tty (merged onto the pty).
+                if params.tty { 1 } else { 2 }
+            };
+            let pump_gate = async {
+                loop {
+                    let notified = role_added.notified();
+                    if output_tasks.lock().await.len() >= expected_pumps {
+                        break;
+                    }
+                    notified.await;
+                }
+            };
+            tokio::pin!(pump_gate);
+            tokio::select! {
+                _ = tokio::time::timeout(std::time::Duration::from_secs(5), pump_gate) => {}
+                _ = &mut detached => { detached_fired = true; }
+            }
         }
 
         // 1. COMPLETION SELECT — the FIRST of three triggers wins (mirroring
