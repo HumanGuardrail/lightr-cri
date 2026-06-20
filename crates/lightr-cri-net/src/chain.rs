@@ -186,15 +186,6 @@ pub fn derive_plugin_config(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    if std::env::var_os("LIGHTR_CNI_TRACE").is_some() {
-        eprintln!(
-            "[lightr-cri-net][TRACE] derive: type={:?} has_portmappings_cap={} port_mappings.len()={}",
-            plugin.get("type"),
-            has_portmappings_cap,
-            port_mappings.len()
-        );
-    }
-
     if has_portmappings_cap && !port_mappings.is_empty() {
         // CRI spec: host_port == 0 means "no host mapping" — omit those entries.
         // Passing host_port=0 to the portmap CNI plugin produces:
@@ -316,21 +307,6 @@ fn bin_dir_from_env() -> String {
     std::env::var("CNI_PATH").unwrap_or_else(|_| "/opt/cni/bin".to_string())
 }
 
-/// True when `LIGHTR_CNI_TRACE` is set to a non-empty, non-"0" value.
-///
-/// When on, [`exec_plugin`] logs the EXACT stdin JSON sent to each plugin plus
-/// the plugin's stdout and stderr, so a portmap no-op (e.g. empty
-/// `runtimeConfig.portMappings` or a `prevResult` with no usable container IP →
-/// portmap silently returns success and creates no DNAT rule, per portmap
-/// v1.9.1 `cmdAdd`) is conclusively visible in CI logs. The CI sets the env var;
-/// nothing in this crate sets it.
-fn cni_trace_on() -> bool {
-    match std::env::var("LIGHTR_CNI_TRACE") {
-        Ok(v) => !v.is_empty() && v != "0",
-        Err(_) => false,
-    }
-}
-
 fn exec_plugin(
     bin_dir: &str,
     plugin_type: &str,
@@ -340,22 +316,6 @@ fn exec_plugin(
     stdin_json: &str,
 ) -> Result<String, CniError> {
     let binary = Path::new(bin_dir).join(plugin_type);
-
-    let trace = cni_trace_on();
-    if trace {
-        // Log the EXACT stdin JSON before exec. For portmap this shows whether
-        // runtimeConfig.portMappings is present (keys/casing/types) and whether
-        // prevResult carries interfaces[]+ips[] with the sandbox container IP.
-        eprintln!(
-            "[lightr-cri-net][TRACE] exec {} CNI_COMMAND={} CNI_IFNAME=eth0 CNI_NETNS={} CNI_CONTAINERID={}\n[lightr-cri-net][TRACE] {} stdin: {}",
-            binary.display(),
-            command,
-            netns,
-            container_id,
-            plugin_type,
-            stdin_json,
-        );
-    }
 
     let mut child = Command::new(&binary)
         .env("CNI_COMMAND", command)
@@ -383,20 +343,6 @@ fn exec_plugin(
     let output = child
         .wait_with_output()
         .map_err(|e| CniError(format!("wait for {plugin_type}: {e}")))?;
-
-    if trace {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!(
-            "[lightr-cri-net][TRACE] {} exit={:?}\n[lightr-cri-net][TRACE] {} stdout: {}\n[lightr-cri-net][TRACE] {} stderr: {}",
-            plugin_type,
-            output.status.code(),
-            plugin_type,
-            stdout.trim_end(),
-            plugin_type,
-            stderr.trim_end(),
-        );
-    }
 
     if output.status.success() {
         String::from_utf8(output.stdout)
