@@ -214,9 +214,17 @@ pub async fn run_exec<S>(
     // of racing a fast-exiting child (see the fast-exit barrier below).
     let role_added = Arc::new(Notify::new());
 
-    // Fired when the read-loop ends because the CLIENT closed its side
-    // (EOF/RST/GoAway). For attach this is a detach; it is one of the two
-    // completion triggers (the other is output-drain).
+    // Fired when the CLIENT closes its side. This is the detach signal feeding
+    // the completion select's detach arm. It MUST resolve on EVERY client-close
+    // path, not just transport teardown:
+    //   - the read-loop ending on EOF/RST/GoAway (whole connection gone), AND
+    //   - the client half-closing its WRITE side after it is done — for attach
+    //     a detaching client sends FLAG_FIN on the streams it writes (stdin,
+    //     and it half-closes its readable error/stdout streams) WITHOUT tearing
+    //     the transport down, so the read-loop keeps spinning and the EOF path
+    //     never fires. A live-container attach then never completes (RACE 2).
+    // So `client_closed` is notified both at loop-end AND inline when the
+    // client FLAG_FINs a stream during an attach (see the Data arm below).
     let client_closed = Arc::new(Notify::new());
 
     // ── concurrent read-loop ──────────────────────────────────────────────
@@ -235,6 +243,9 @@ pub async fn run_exec<S>(
         let role_added = role_added.clone();
         let client_closed = client_closed.clone();
         let abort_list = abort_list.clone();
+        // `verb` is `Copy`; the read-loop needs it to decide whether a client
+        // FLAG_FIN is a detach (attach) — see the Data arm's RACE 2 handling.
+        let is_attach = verb == StreamVerb::Attach;
         tokio::spawn(async move {
             let mut roles = roles;
             let mut stdin = stdin;
@@ -334,6 +345,20 @@ pub async fn run_exec<S>(
                                 // drop stdin so the process sees EOF
                                 stdin = None;
                             }
+                            // RACE 2: a client half-closing its write side is a
+                            // detach handshake — for attach to a LIVE container
+                            // there is no reaper signal and the container does
+                            // not exit, so this FLAG_FIN (the client closing the
+                            // streams it owns as it detaches) is what must drive
+                            // completion. The transport stays up, so the EOF
+                            // path at loop-end does NOT fire; signal detach
+                            // inline. For exec this is harmless: the reaper wins
+                            // first and client-go keeps its write half open
+                            // until it reads the Status, so it does not FLAG_FIN
+                            // early.
+                            if is_attach {
+                                client_closed.notify_waiters();
+                            }
                         }
                     }
                     Frame::Ping { id } => {
@@ -375,6 +400,26 @@ pub async fn run_exec<S>(
     // instantly → Status{Success}, which is the "container exit code if known,
     // else Success" semantics. The read-loop keeps draining stdin/resize/ping
     // concurrently throughout.
+    // The FULL set of stream roles the client WILL open for this session,
+    // derived from the request flags + verb. client-go's createStreams (v2.go,
+    // inherited by v3/v4) opens, in order: error (always), stdin (if
+    // params.stdin), stdout (always), stderr (only when NOT tty). The
+    // fast-exit barrier must wait for ALL of these to land in `by_role` before
+    // completion is allowed to tear the connection down — otherwise a fast exec
+    // (`echo`) can complete + the TaskGuard can reset a client SYN_STREAM that
+    // is still in flight, surfacing as client-go's "failed to open streamer"
+    // (RACE 1). The set is the same for exec and attach.
+    let expected_roles: Vec<u8> = {
+        let mut v = vec![ch::ERROR, ch::STDOUT];
+        if params.stdin {
+            v.push(ch::STDIN);
+        }
+        if !params.tty {
+            v.push(ch::STDERR);
+        }
+        v
+    };
+
     if let Some(waiter) = waiter {
         let is_attach = verb == StreamVerb::Attach;
         let mut reaper = tokio::task::spawn_blocking(move || waiter.wait());
@@ -396,18 +441,19 @@ pub async fn run_exec<S>(
         tokio::pin!(detached);
 
         // 0. Fast-exit barrier. A fast command (e.g. `echo`) can make the
-        //    output pumps drain BEFORE the read-loop has processed the client's
-        //    stdout/error SYN_STREAM frames. If we snapshot `by_role` now we
-        //    may miss those ids and silently skip the FIN/Status — and a real
-        //    client-go executor then hangs forever on a Status that never
-        //    comes. So WAIT until both STDOUT and ERROR ids are present
-        //    (STDERR is optional — absent for TTY execs), bounded by a ~5s
-        //    backstop. For attach the client may detach before opening any
-        //    output stream, so race the barrier against `client_closed` and
-        //    bail straight to teardown on detach. Deadlock-free: conformant
-        //    client-go opens error+stdout (and stderr for non-TTY) via
-        //    SYN_STREAM synchronously at stream() start, BEFORE it blocks on
-        //    the server, so the barrier resolves in ms.
+        //    output pumps drain — and the reaper fire — BEFORE the read-loop
+        //    has processed all of the client's SYN_STREAM frames. If completion
+        //    proceeds now, the TaskGuard tears the connection down while a
+        //    still-in-flight client SYN_STREAM (stderr/stdin) is reset, which
+        //    client-go reports as "failed to open streamer" (RACE 1). So WAIT
+        //    until EVERY role the client WILL open (`expected_roles`, derived
+        //    above from tty/stdin/verb) is present in `by_role`, bounded by a
+        //    ~5s backstop. For attach the client may detach before opening the
+        //    full set, so race the barrier against `client_closed` and bail
+        //    straight to teardown on detach. Deadlock-free: conformant
+        //    client-go opens its whole stream set via SYN_STREAM synchronously
+        //    at stream() start, BEFORE it blocks on the server, so the barrier
+        //    resolves in ms.
         let barrier = async {
             loop {
                 // Register for the next notify BEFORE re-checking, so an insert
@@ -415,7 +461,7 @@ pub async fn run_exec<S>(
                 let notified = role_added.notified();
                 {
                     let g = by_role.lock().await;
-                    if g.contains_key(&ch::STDOUT) && g.contains_key(&ch::ERROR) {
+                    if expected_roles.iter().all(|r| g.contains_key(r)) {
                         break;
                     }
                 }
