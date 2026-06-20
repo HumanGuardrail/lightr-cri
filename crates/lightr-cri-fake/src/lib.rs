@@ -567,12 +567,16 @@ fn open_cri_log(log_dir: &str, log_path: &str) -> std::io::Result<Option<fs::Fil
 /// to the log file. The log file handle is Arc<Mutex<>> so multiple streams
 /// can interleave safely.
 ///
-/// This is the SINGLE reader of the container's output for this stream. When a
-/// `fanout` is supplied it ALSO copies the raw line bytes (byte-for-byte, the
-/// same bytes that would appear on the container's fd) to every registered
-/// attacher sink, so attach is purely additive and never introduces a second
-/// reader racing the log. The CRI log write path is unchanged and remains
-/// byte-identical regardless of whether attachers are present.
+/// This is the SINGLE reader of the container's output for this stream. It reads
+/// RAW chunks (not line-delimited): when a `fanout` is supplied it broadcasts
+/// each chunk to every registered attacher sink IMMEDIATELY, before doing any
+/// line framing, so interactive attach output (an echoed line, a prompt with no
+/// trailing newline) reaches the attacher with bare read→broadcast latency
+/// instead of being stuck in a line buffer until the next '\n' — the defect that
+/// hung critest's attach round-trip. Attach is still purely additive and never
+/// introduces a second reader racing the log. The CRI log write path keeps the
+/// same per-line F/P framing (full lines as they complete; a trailing partial
+/// line flushed at EOF), so the log remains byte-identical for complete lines.
 fn spawn_tee_thread(
     stream_name: &'static str,
     reader: std::fs::File,
@@ -580,28 +584,50 @@ fn spawn_tee_thread(
     fanout: Option<Arc<FanOut>>,
 ) {
     std::thread::spawn(move || {
-        use std::io::{BufRead, BufReader};
-        let br = BufReader::new(reader);
-        for line in br.split(b'\n') {
-            match line {
-                Ok(mut data) => {
-                    // split() strips the delimiter — re-add newline for F tag
-                    data.push(b'\n');
-                    // (a) CRI log — byte-identical to pre-fanout behavior.
-                    let formatted = cri_log_line(stream_name, &data);
-                    {
-                        let mut lg = log.lock().unwrap();
-                        if let Some(f) = lg.as_mut() {
-                            use std::io::Write;
-                            let _ = f.write_all(&formatted);
-                        }
-                    }
-                    // (b) live attachers — receive the raw container bytes.
-                    if let Some(fo) = &fanout {
-                        fo.broadcast(stream_name, &data);
-                    }
+        use std::io::{Read, Write};
+        let mut reader = reader;
+        let mut buf = [0u8; 8192];
+        // Pending CRI-log bytes that have not yet been terminated by a '\n'.
+        // The attach fan-out must NOT wait on this boundary — interactive output
+        // (a shell echoing a typed line, a prompt with no trailing newline)
+        // must reach the attacher as soon as the kernel hands us the bytes, or
+        // critest's attach round-trip blocks 60s waiting for an echo that is
+        // stuck in a line buffer. So we broadcast EVERY raw chunk immediately
+        // and keep the line framing only for the (a) CRI log path.
+        let mut log_pending: Vec<u8> = Vec::new();
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let chunk = &buf[..n];
+
+            // (a) live attachers — raw bytes, byte-for-byte, no newline gate.
+            // Done FIRST so attach latency is the bare read→broadcast hop.
+            if let Some(fo) = &fanout {
+                fo.broadcast(stream_name, chunk);
+            }
+
+            // (b) CRI log — accumulate and emit one formatted record per
+            // complete '\n'-terminated line (F tag), byte-identical to the
+            // previous per-line behavior. A trailing partial line stays in
+            // `log_pending` until its newline arrives (or the stream ends).
+            log_pending.extend_from_slice(chunk);
+            while let Some(pos) = log_pending.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = log_pending.drain(..=pos).collect();
+                let formatted = cri_log_line(stream_name, &line);
+                let mut lg = log.lock().unwrap();
+                if let Some(f) = lg.as_mut() {
+                    let _ = f.write_all(&formatted);
                 }
-                Err(_) => break,
+            }
+        }
+        // Flush any final unterminated bytes to the log as a partial (P) record.
+        if !log_pending.is_empty() {
+            let formatted = cri_log_line(stream_name, &log_pending);
+            let mut lg = log.lock().unwrap();
+            if let Some(f) = lg.as_mut() {
+                let _ = f.write_all(&formatted);
             }
         }
     });
