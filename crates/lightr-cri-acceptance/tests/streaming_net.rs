@@ -583,11 +583,27 @@ fn b5_hostport() {
     let td = tmpdir("b5");
 
     // Non-hostNetwork pod with a hostPort mapping: 127.0.0.1:12000 → container:80.
+    //
+    // CRI law: PortMappings is a field of PodSandboxConfig, NOT ContainerConfig.
+    // CNI ADD (and therefore the portmap DNAT rule) runs at `runp` time off the
+    // SANDBOX config's port_mappings — crictl `runp` reads `portMappings` only
+    // from the pod JSON. Putting the mapping on the container JSON leaves the
+    // sandbox port_mappings EMPTY, so portmap gets no runtimeConfig, no DNAT
+    // rule is created, and curl to 127.0.0.1:12000 is refused (exit 7). The
+    // mapping MUST live here on the pod config to reach CNI.
     let linux_ns =
         serde_json::json!({ "securityContext": { "namespaceOptions": { "network": 0 } } });
+    // hostPort mapping: containerPort=80 hostPort=12000 hostIp=127.0.0.1.
+    let pod_port_mappings = serde_json::json!([{
+        "containerPort": 80,
+        "hostPort": 12000,
+        "hostIp": "127.0.0.1",
+        "protocol": "TCP"
+    }]);
     let json = serde_json::json!({
         "metadata": { "name": "b5-pod", "uid": "b5-uid-0001", "namespace": "acceptance-b", "attempt": 0 },
         "log_directory": "/tmp",
+        "port_mappings": pod_port_mappings,
         "linux": linux_ns
     });
     let pod_path = td.join("b5-pod.json");
@@ -618,14 +634,10 @@ fn b5_hostport() {
         ]
     };
 
-    // hostPort mapping: containerPort=80 hostPort=12000 hostIp=127.0.0.1.
-    let pm = serde_json::json!([{
-        "containerPort": 80,
-        "hostPort": 12000,
-        "hostIp": "127.0.0.1",
-        "protocol": "TCP"
-    }]);
-    let ctr_json = write_ctr_json(&td, "b5-ctr", "ref/httpd", &cmd, Some(pm));
+    // The hostPort mapping lives on the POD config (above), per CRI. The
+    // container itself just binds port 80 inside the sandbox netns; it carries
+    // no portMappings of its own.
+    let ctr_json = write_ctr_json(&td, "b5-ctr", "ref/httpd", &cmd, None);
 
     let out = ctl(&srv.socket, &["runp", pod_path.to_str().unwrap()]);
     assert!(

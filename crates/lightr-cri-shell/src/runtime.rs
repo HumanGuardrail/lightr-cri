@@ -391,8 +391,21 @@ async fn validate_sandbox_ready_get_ip<B: CriBackend>(
                 id.0, ss.state
             )));
         }
-        // dial_target: sandbox ip if set, else 127.0.0.1 (host_network path)
-        let dial = ss.ip.unwrap_or_else(|| "127.0.0.1".to_string());
+        // dial_target (contract §B AMENDED 2026-06-19):
+        //   - CNI sandbox (netns_path Some): the streamer enters the sandbox
+        //     netns and must dial the pod's OWN loopback `127.0.0.1:<port>` —
+        //     NOT the CNI IP. The in-container server binds 0.0.0.0, so inside
+        //     the netns 127.0.0.1 reaches it. Dialing the CNI IP from inside its
+        //     own netns is a hairpin to the external address that the bridge /
+        //     ipMasq rules do not route back, so the connect hangs → curl times
+        //     out (exit 28). Loopback is the only reliable in-netns target.
+        //   - host_network sandbox (netns_path None): no netns to enter; dial
+        //     the host loopback 127.0.0.1 directly.
+        let dial = if ss.netns_path.is_some() {
+            "127.0.0.1".to_string()
+        } else {
+            ss.ip.unwrap_or_else(|| "127.0.0.1".to_string())
+        };
         Ok((dial, ss.netns_path))
     })
     .await
