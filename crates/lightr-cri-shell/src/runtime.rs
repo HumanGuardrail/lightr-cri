@@ -498,6 +498,12 @@ impl<B: CriBackend> RuntimeService for RuntimeShell<B> {
             .ok_or_else(|| Status::invalid_argument("config.metadata is required"))?;
 
         // v1.1 decode: dns, port_mappings, host_network (network==NODE), hostname
+        if std::env::var_os("LIGHTR_CNI_TRACE").is_some() {
+            eprintln!(
+                "[shell][TRACE] run_pod_sandbox received {} port_mappings from crictl",
+                pod_cfg.port_mappings.len()
+            );
+        }
         let dns = decode_dns(pod_cfg.dns_config);
         let port_mappings = pod_cfg
             .port_mappings
