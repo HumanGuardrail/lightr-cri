@@ -41,6 +41,8 @@ jobs:
     env:
       LIGHTR_CRI_REQUIRE_PROBES: "1"
       LIGHTR_BUDGET_CLASS: hosted-linux
+      # temporary: trace the exact CNI portmap stdin/stdout to disambiguate b5
+      LIGHTR_CNI_TRACE: "1"
       # CI safety net: cap any single streaming session so a stuck exec/attach
       # can't hang the whole critest suite (a hung attach once ate the 60min
       # budget). Unset in production — sessions are legitimately long-lived.
