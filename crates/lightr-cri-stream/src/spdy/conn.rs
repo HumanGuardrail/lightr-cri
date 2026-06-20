@@ -622,14 +622,34 @@ pub async fn run_exec<S>(
         drop(w);
     }
 
-    // Completion has been signalled (or there was no process to reap). The
-    // client's subsequent conn.Close once it reads the Status is a benign
-    // normal end; we no longer need the read-loop, so wind it down explicitly
-    // (the NORMAL teardown path). The output pumps have already drained/aborted
-    // above and the reaper has resolved or been aborted. `_guard` then drops at
-    // function end and aborts the whole registered set again — a no-op now, but
-    // the SAME drop runs if `run_exec`'s future is cancelled before reaching
-    // here (session cap), which is what makes the cap actually tear down.
+    // GRACEFUL TEARDOWN — decouple teardown from completion (the last tty=true
+    // EPIPE flake). Completion has been signalled: the Status + FLAG_FINs are on
+    // the wire. But for a FAST tty exec (`echo` exits in ms) the server reaches
+    // here while client-go may STILL be writing its SYN_STREAM/stdin frames to
+    // OPEN the session. If we abort the read-loop / drop the socket now, those
+    // in-flight client writes hit a closed socket → EPIPE → "failed to open
+    // streamer" (RACE 3 — the residual window the barrier + drain gates above
+    // narrowed but could not close, since they gate completion, not teardown).
+    //
+    // So do NOT abort immediately. Keep the read-loop ALIVE so it keeps DRAINING
+    // the client's inbound frames (consuming its handshake/stdin writes — never
+    // EPIPE), and WAIT for the CLIENT to close its side: the read-loop ends on
+    // EOF/RST/GoAway once client-go has read the Status off the error stream and
+    // closed cleanly. We await the read-loop handle directly — it resolves on
+    // exactly that client-close. BOUNDED by a 5s grace so a misbehaving client
+    // can never hang teardown.
+    //
+    // This does NOT reintroduce the old Status-before-close deadlock: the Status
+    // was ALREADY emitted above (lines emitting FLAG_FIN + metav1.Status), so we
+    // wait-for-close AFTER the Status, not before it. Both exec and attach reach
+    // here after completion; for attach the detach path already drove completion,
+    // and the read-loop has typically ended (or will within grace), so detach
+    // still completes. After the grace wait — or the moment the client closes —
+    // we wind the read-loop down explicitly and `_guard` drops at function end,
+    // aborting the whole registered set (a no-op if the read-loop already ended,
+    // but the SAME drop runs if `run_exec`'s future is cancelled before reaching
+    // here (session cap), which is what makes the cap actually tear down).
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), &mut read_loop).await;
     read_loop.abort();
     let _ = read_loop.await;
 }
