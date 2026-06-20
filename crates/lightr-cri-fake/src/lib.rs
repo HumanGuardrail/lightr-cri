@@ -923,10 +923,15 @@ impl CriBackend for FakeBackend {
         let default_command: Vec<String>;
         let (effective_command, effective_args): (&[String], &[String]) =
             if (rec.config.command.is_empty() && rec.config.args.is_empty()) || is_keepalive_top {
+                // Keep-alive via `tail -f /dev/null` (blocks forever, ~0 CPU).
+                // IMPORTANT: do NOT use a `sleep` loop — critest's
+                // execSync-with-timeout checks `pgrep sleep` is empty after a
+                // timed-out exec, and pause `sleep` processes would pollute that
+                // (the fake shares the host PID namespace).
                 default_command = vec![
-                    "/bin/sh".to_string(),
-                    "-c".to_string(),
-                    "while true; do sleep 2147483647; done".to_string(),
+                    "tail".to_string(),
+                    "-f".to_string(),
+                    "/dev/null".to_string(),
                 ];
                 (&default_command, &[])
             } else {
