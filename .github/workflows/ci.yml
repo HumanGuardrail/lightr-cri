@@ -100,10 +100,20 @@ jobs:
           echo "/usr/sbin" >> "$GITHUB_PATH"
           PATH="/usr/sbin:$PATH" command -v iptables
           # hostPort DNAT to a loopback hostIP (127.0.0.1) only routes when
-          # route_localnet is enabled — otherwise the DNAT rule is skipped for
-          # martian 127.0.0.0/8 traffic and curl 127.0.0.1:<hostPort> is refused
-          # (b5_hostport). Real nodes set this for hostPort; enable it on the runner.
+          # route_localnet is enabled — otherwise the kernel treats the 127/8
+          # source as a martian and the DNAT'd packet is dropped, so
+          # curl 127.0.0.1:<hostPort> is refused (b5_hostport). The portmap
+          # plugin itself sets route_localnet on the *routable* host interface
+          # (cni0, via netlink RouteGet on the pod IP), but a host-ORIGINATED
+          # curl to 127.0.0.1 traverses OUTPUT bound to `lo` first; the reroute
+          # of that 127-sourced packet toward cni0 needs route_localnet on the
+          # ingress (`lo`) side too. `all` does NOT OR into the per-iface value
+          # for this check, so set all + lo + (best-effort) cni0 explicitly.
+          # Real nodes set these for hostPort; enable them on the runner.
           sudo sysctl -w net.ipv4.conf.all.route_localnet=1
+          sudo sysctl -w net.ipv4.conf.lo.route_localnet=1
+          # cni0 may not exist yet (created on first CNI ADD); ignore if absent.
+          sudo sysctl -w net.ipv4.conf.cni0.route_localnet=1 2>/dev/null || true
 
       - name: install CNI plugins v1.9.1 and kubelet v1.33.13 (pinned sha256)
         run: |
