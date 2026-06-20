@@ -181,6 +181,21 @@ jobs:
       - name: greenlist gate
         run: bash ci/greenlist-gate.sh
 
+      # Sign the structural KPIs (cold-start, idle RSS, crash-recovery) of the
+      # daemonless/crash-only shell. Measurement only — emits a signed JSON
+      # artifact; CAS-tier KPIs are out of scope here (real backend). Fail-closed
+      # on a missing core probe (crictl) since REQUIRE_PROBES=1.
+      - name: bench (sign structural KPIs)
+        run: bash ci/bench.sh
+
+      - name: upload bench artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: ci/bench-results.json
+          if-no-files-found: warn
+
       - name: B7 kubelet-smoke gate
         env:
           LIGHTR_CRI_BIN: target/release/lightr-cri
