@@ -5,15 +5,28 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+# The backend-agnostic server wiring (the integration swap seam).
+[lib]
+name = "lightr_cri_server"
+path = "src/lib.rs"
+
+# The in-repo conformance driver: wires the fake backend into the generic lib.
+# Compiled only with `fake-bin` (default); consumers take the lib fake-free via
+# `default-features = false`.
 [[bin]]
 name = "lightr-cri"
 path = "src/main.rs"
+required-features = ["fake-bin"]
+
+[features]
+default = ["fake-bin"]
+fake-bin = ["dep:lightr-cri-fake"]
 
 [dependencies]
 lightr-cri-proto = { path = "../lightr-cri-proto" }
 lightr-cri-backend = { path = "../lightr-cri-backend" }
 lightr-cri-shell = { path = "../lightr-cri-shell" }
-lightr-cri-fake = { path = "../lightr-cri-fake" }
+lightr-cri-fake = { path = "../lightr-cri-fake", optional = true }
 lightr-cri-stream = { path = "../lightr-cri-stream" }
 tonic = { workspace = true }
 tokio = { workspace = true }
