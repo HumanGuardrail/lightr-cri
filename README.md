@@ -1,5 +1,7 @@
 # lightr-cri
 
+[![ci](https://github.com/HumanGuardrail/lightr-cri/actions/workflows/ci.yml/badge.svg)](https://github.com/HumanGuardrail/lightr-cri/actions/workflows/ci.yml)
+
 **The Kubernetes node that materializes from CAS.** A stateless, crash-only
 CRI (Container Runtime Interface) implementation: the kubelet talks to a
 socket; behind it, pods hydrate lazily from a content-addressed store and
